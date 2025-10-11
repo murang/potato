@@ -1,11 +1,12 @@
 package main
 
 import (
+	"example/nicepb/nice"
+	"reflect"
+
 	"github.com/murang/potato"
-	"github.com/murang/potato/example/nicepb/nice"
 	"github.com/murang/potato/log"
 	"google.golang.org/protobuf/proto"
-	"reflect"
 )
 
 // 用泛型定义函数 让入参可以是不同类型 方便路由不同消息

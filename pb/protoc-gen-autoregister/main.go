@@ -23,7 +23,7 @@ func init() {
     {{- end }}
 
 	{{- range .Messages}}
-    vt.Register[*{{ .Message }}]()
+    vt.Register(&{{ .Message }}{})
     {{- end }}
 }
 `

@@ -2,9 +2,11 @@ package net
 
 import (
 	"encoding/binary"
-	"github.com/murang/potato/pb"
-	"google.golang.org/protobuf/proto"
 	"reflect"
+
+	"github.com/murang/potato/pb"
+	"github.com/murang/potato/pb/vt"
+	"google.golang.org/protobuf/proto"
 )
 
 type PbPairCodec struct {
@@ -26,7 +28,7 @@ func (c *PbPairCodec) Encode(v interface{}) (msgBytes []byte, err error) {
 	}
 
 	// 消息序列化
-	data, err := proto.Marshal(msg)
+	data, err := vt.Marshal(msg)
 	if err != nil {
 		return
 	}
@@ -49,6 +51,6 @@ func (c *PbPairCodec) Decode(data []byte) (msg interface{}, err error) {
 
 	// 消息反序列化
 	msg = reflect.New(msgType.Elem()).Interface()
-	err = proto.Unmarshal(data[lenMsgId:], msg.(proto.Message))
+	err = vt.Unmarshal(data[lenMsgId:], msg.(proto.Message))
 	return
 }

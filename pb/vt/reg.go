@@ -2,8 +2,8 @@ package vt
 
 import (
 	"sync"
-	"unsafe"
 
+	"github.com/murang/potato/util"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -27,20 +27,19 @@ var (
 )
 
 // 注册一个消息类型
-func Register[T VTProtoMessage]() {
-	var zero T
-	typeID := typeIDOf(zero)
+func Register[T VTProtoMessage](t T) {
+	typePtr := util.TypePtrOf(t)
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	vtMarshalFuncs[typeID] = func(msg VTProtoMessage) ([]byte, error) {
+	vtMarshalFuncs[typePtr] = func(msg VTProtoMessage) ([]byte, error) {
 		return msg.(T).MarshalVT()
 	}
-	vtUnmarshalFuncs[typeID] = func(msg VTProtoMessage, b []byte) error {
+	vtUnmarshalFuncs[typePtr] = func(msg VTProtoMessage, b []byte) error {
 		return msg.(T).UnmarshalVT(b)
 	}
-	vtSizeFuncs[typeID] = func(msg VTProtoMessage) int {
+	vtSizeFuncs[typePtr] = func(msg VTProtoMessage) int {
 		return msg.(T).SizeVT()
 	}
 }
@@ -48,10 +47,10 @@ func Register[T VTProtoMessage]() {
 // 统一 Marshal
 func Marshal(msg proto.Message) ([]byte, error) {
 	if v, ok := msg.(VTProtoMessage); ok {
-		typeID := typeIDOf(v)
+		typePtr := util.TypePtrOf(v)
 
 		mu.RLock()
-		fn, ok := vtMarshalFuncs[typeID]
+		fn, ok := vtMarshalFuncs[typePtr]
 		mu.RUnlock()
 		if ok {
 			return fn(v)
@@ -70,10 +69,10 @@ func Unmarshal(data []byte, msg proto.Message) error {
 		r.Reset()
 	}
 	if v, ok := msg.(VTProtoMessage); ok {
-		typeID := typeIDOf(v)
+		typePtr := util.TypePtrOf(v)
 
 		mu.RLock()
-		fn, ok := vtUnmarshalFuncs[typeID]
+		fn, ok := vtUnmarshalFuncs[typePtr]
 		mu.RUnlock()
 		if ok {
 			return fn(v, data)
@@ -86,10 +85,10 @@ func Unmarshal(data []byte, msg proto.Message) error {
 // 统一 Size
 func Size(msg proto.Message) int {
 	if v, ok := msg.(VTProtoMessage); ok {
-		typeID := typeIDOf(v)
+		typePtr := util.TypePtrOf(v)
 
 		mu.RLock()
-		fn, ok := vtSizeFuncs[typeID]
+		fn, ok := vtSizeFuncs[typePtr]
 		mu.RUnlock()
 		if ok {
 			return fn(v)
@@ -97,9 +96,4 @@ func Size(msg proto.Message) int {
 		return v.SizeVT()
 	}
 	return proto.Size(msg)
-}
-
-// unsafe 获取类型唯一 ID（避免反射开销）
-func typeIDOf[T any](t T) uintptr {
-	return (*[2]uintptr)(unsafe.Pointer(&t))[0]
 }

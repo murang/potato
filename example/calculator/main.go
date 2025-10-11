@@ -1,9 +1,10 @@
 package main
 
 import (
+	"example/nicepb/nice"
+
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/murang/potato"
-	"github.com/murang/potato/example/nicepb/nice"
 	"github.com/murang/potato/rpc"
 )
 

@@ -2,14 +2,15 @@ package main
 
 import (
 	"encoding/binary"
-	"github.com/murang/potato/example/nicepb/nice"
-	pnet "github.com/murang/potato/net"
+	"example/nicepb/nice"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	pnet "github.com/murang/potato/net"
 )
 
 func main() {

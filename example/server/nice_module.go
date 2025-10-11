@@ -1,9 +1,10 @@
 package main
 
 import (
+	"example/nicepb/nice"
 	"fmt"
+
 	"github.com/murang/potato"
-	"github.com/murang/potato/example/nicepb/nice"
 	"github.com/murang/potato/log"
 )
 

@@ -3,9 +3,11 @@ package net
 import (
 	"encoding/binary"
 	"errors"
-	"github.com/murang/potato/pb"
-	"google.golang.org/protobuf/proto"
 	"reflect"
+
+	"github.com/murang/potato/pb"
+	"github.com/murang/potato/pb/vt"
+	"google.golang.org/protobuf/proto"
 )
 
 // pb消息按照 【消息id + 消息内容bytes】 的格式进行传输 消息id占4字节
@@ -38,7 +40,7 @@ func (c *PbCodec) Encode(v interface{}) (msgBytes []byte, err error) {
 	}
 
 	// 消息序列化
-	data, err := proto.Marshal(msg)
+	data, err := vt.Marshal(msg)
 	if err != nil {
 		return
 	}
@@ -61,6 +63,6 @@ func (c *PbCodec) Decode(data []byte) (msg interface{}, err error) {
 
 	// 消息反序列化
 	msg = reflect.New(msgType.Elem()).Interface()
-	err = proto.Unmarshal(data[lenMsgId:], msg.(proto.Message))
+	err = vt.Unmarshal(data[lenMsgId:], msg.(proto.Message))
 	return
 }

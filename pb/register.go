@@ -1,9 +1,10 @@
 package pb
 
 import (
-	"github.com/murang/potato/log"
 	"os"
 	"reflect"
+
+	"github.com/murang/potato/log"
 )
 
 // ⚠️ 注册的消息type全是指针

@@ -1,6 +1,6 @@
 package main
 
-import "github.com/murang/potato/example/nicepb/nice"
+import "example/nicepb/nice"
 
 func OnEvent(evt any) {
 	switch event := evt.(type) {
