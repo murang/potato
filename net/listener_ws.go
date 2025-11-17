@@ -1,18 +1,21 @@
 package net
 
 import (
-	"github.com/gorilla/websocket"
-	"github.com/murang/potato/log"
+	"context"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/murang/potato/log"
 )
 
 // server
 type wsListener struct {
 	addr            string
 	listener        net.Listener
+	server          *http.Server
 	upgrade         *websocket.Upgrader
 	exit            bool
 	onNewConnection func(net.Conn)
@@ -34,12 +37,15 @@ func newWsListener(addr string) (*wsListener, error) {
 			},
 		},
 	}
+	s.server = &http.Server{
+		Handler: s,
+	}
 	return s, nil
 }
 
 func (s *wsListener) Start() {
 	go func() {
-		err := http.Serve(s.listener, s)
+		err := s.server.Serve(s.listener)
 		if err != nil {
 			log.Sugar.Errorf("ws serve error:%v", err)
 		}
@@ -48,7 +54,9 @@ func (s *wsListener) Start() {
 
 func (s *wsListener) Stop() {
 	s.exit = true
-	err := s.listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := s.server.Shutdown(ctx)
 	if err != nil {
 		log.Sugar.Errorf("close ws listener error: %v", err)
 		return
