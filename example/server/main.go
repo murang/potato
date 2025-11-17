@@ -21,7 +21,7 @@ func main() {
 		MsgHandler:     &MyMsgHandler{},
 	})
 	// 网络监听器 支持tcp/kcp/ws
-	ln, err := net.NewListener("tcp", ":10086")
+	ln, err := net.NewListener("ws", ":10086")
 	if err != nil {
 		panic(err)
 	}
@@ -40,7 +40,7 @@ func main() {
 		log.Logger.Info("all module started, server start")
 		return true
 	})
-	potato.Run()        // 开始update 所有组件开始tick 主线程阻塞
+	potato.Run() // 开始update 所有组件开始tick 主线程阻塞
 	potato.End(func() { // 主线程开始退出 所有组件销毁后执行入参函数
 		log.Logger.Info("all module stopped, server stop")
 	})

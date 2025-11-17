@@ -46,7 +46,7 @@ func newWsListener(addr string) (*wsListener, error) {
 func (s *wsListener) Start() {
 	go func() {
 		err := s.server.Serve(s.listener)
-		if err != nil {
+		if err != nil && !s.exit {
 			log.Sugar.Errorf("ws serve error:%v", err)
 		}
 	}()
