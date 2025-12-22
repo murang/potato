@@ -130,6 +130,17 @@ func (m *MyMsgHandler) OnMsg(session *net.Session, msg any) {
 
 设置服务器集群需要有consul提供服务发现 具体安装方法等参考[consul](https://github.com/hashicorp/consul) 本地测试推荐docker安装
 
+rpc使用到了proto actor的grain生成 编译pb的时候需要安装插件 详情参考[protoc-gen-go-grain](https://github.com/asynkron/protoactor-go/tree/dev/protobuf/protoc-gen-go-grain)和示例
+```shell
+# 安装插件
+go install github.com/asynkron/protoactor-go/protobuf/protoc-gen-go-grain@latest
+# 添加环境变量
+export PATH="$PATH:$(go env GOPATH)/bin"
+# 编译rpc所需pb文件
+protoc --go_out=. --go_opt=paths=source_relative \
+         --go-grain_out=. --go-grain_opt=paths=source_relative hello.proto
+```
+
 设置rpc服务：  
 ```go
 potato.SetRpcConfig(&rpc.Config{
