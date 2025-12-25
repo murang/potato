@@ -12,6 +12,10 @@ import (
 var consulClient *api.Client
 var onConfigChange = make([]func(IConfig), 0)
 
+// 缓存上一次的 KV 状态，用于检测真正变更的配置
+// key: KV的Key, value: ModifyIndex
+var kvCache = make(map[string]uint64)
+
 // 监听配置更新
 func watchConfigUpdate() {
 	// 获取全部配置前缀
@@ -49,8 +53,21 @@ func watchConfigUpdate() {
 
 // 处理配置变更
 func handleConfigChanges(pairs api.KVPairs) {
+	// 构建当前 KV 的 key 集合，用于检测删除
+	currentKeys := make(map[string]struct{}, len(pairs))
+
 	// 处理新增或修改的配置
 	for _, pair := range pairs {
+		currentKeys[pair.Key] = struct{}{}
+
+		// 检查是否真正变更（通过 ModifyIndex 判断）
+		if lastIndex, exists := kvCache[pair.Key]; exists && lastIndex == pair.ModifyIndex {
+			continue // ModifyIndex 未变，跳过
+		}
+
+		// 更新缓存
+		kvCache[pair.Key] = pair.ModifyIndex
+
 		if len(pair.Value) == 0 {
 			continue // 跳过空配置
 		}
@@ -72,6 +89,14 @@ func handleConfigChanges(pairs api.KVPairs) {
 			for _, f := range onConfigChange {
 				f(cfg)
 			}
+		}
+	}
+
+	// 清理已删除的 key 缓存（可选）
+	for key := range kvCache {
+		if _, exists := currentKeys[key]; !exists {
+			delete(kvCache, key)
+			log.Sugar.Infof("config deleted: %s", key)
 		}
 	}
 }

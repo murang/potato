@@ -1,9 +1,10 @@
 package main
 
 import (
+	"math/rand"
+
 	"github.com/murang/potato/config"
 	"github.com/murang/potato/log"
-	"math/rand"
 )
 
 type WorkModule struct {
@@ -21,13 +22,13 @@ func (w WorkModule) OnStart() {
 	log.Sugar.Info("work module start, load configs first ~")
 
 	// 本地配置
-	config.LoadConfig(&UserConfig{})
-	config.LoadConfig(&PriceConfig{}, "b") // 加载主配置以及tag配置
+	//config.LoadConfig(&UserConfig{})
+	//config.LoadConfig(&PriceConfig{}, "b") // 加载主配置以及tag配置
 
 	// consul配置 可把配置放入consul的kv中尝试读取
-	//config.FocusConsulConfig(&UserConfig{})
-	//config.FocusConsulConfig(&PriceConfig{})
-	//config.SetConsul("localhost:8500")
+	config.FocusConsulConfig(&UserConfig{})
+	config.FocusConsulConfig(&PriceConfig{})
+	config.SetConsul("localhost:8500")
 }
 
 func (w WorkModule) OnUpdate() {
@@ -35,7 +36,7 @@ func (w WorkModule) OnUpdate() {
 	userCfg := config.GetConfig[*UserConfig]()
 	priceCfg := config.GetConfig[*PriceConfig]()
 	if rand.Intn(100) > 50 {
-		tom := userCfg.GetUserByName("Tom")
+		tom := userCfg.GetUserByName("Tomi")
 		log.Sugar.Info("Tom likes ", tom.Likes)
 		log.Sugar.Info("Milk price: ", priceCfg.Milk)
 	} else {
