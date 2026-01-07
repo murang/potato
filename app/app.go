@@ -2,18 +2,19 @@ package app
 
 import (
 	"errors"
-	"github.com/asynkron/protoactor-go/actor"
-	"github.com/asynkron/protoactor-go/cluster"
-	"github.com/asynkron/protoactor-go/scheduler"
-	"github.com/murang/potato/log"
-	"github.com/murang/potato/net"
-	"github.com/murang/potato/rpc"
 	"os"
 	"os/signal"
 	"runtime"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/asynkron/protoactor-go/actor"
+	"github.com/asynkron/protoactor-go/cluster"
+	"github.com/asynkron/protoactor-go/scheduler"
+	"github.com/murang/potato/log"
+	"github.com/murang/potato/net"
+	"github.com/murang/potato/rpc"
 )
 
 var (
@@ -109,6 +110,14 @@ func (a *Application) Start(f func() bool) {
 		os.Exit(1)
 	}()
 
+	// 先执行初始化逻辑 再执行集群和网络 否则可能出现网络或者rpc消息过来 但是数据库等等没准备好的情况
+	if f != nil {
+		ret := f()
+		if !ret {
+			_ = log.Logger.Sync()
+			os.Exit(1)
+		}
+	}
 	// rpc StartMember 需要先执行 否则net中获取grain会出错
 	if a.RpcManager != nil {
 		a.Cluster = a.RpcManager.Start(a.ActorSystem)
@@ -125,14 +134,6 @@ func (a *Application) Start(f func() bool) {
 		pid := a.ActorSystem.Root.Spawn(props)
 		a.name2pid.Store(mid, pid)
 		log.Logger.Info("module init : " + mid)
-	}
-
-	if f != nil {
-		ret := f()
-		if !ret {
-			_ = log.Logger.Sync()
-			os.Exit(1)
-		}
 	}
 }
 

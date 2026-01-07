@@ -1,6 +1,6 @@
 module github.com/murang/potato
 
-go 1.25.1
+go 1.25.2
 
 require (
 	github.com/asynkron/protoactor-go v0.0.0-20240822202345-3c0e61ca19c9
