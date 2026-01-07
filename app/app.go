@@ -28,7 +28,6 @@ type Application struct {
 	cancels  []scheduler.CancelFunc
 
 	ActorSystem *actor.ActorSystem
-	Cluster     *cluster.Cluster
 	NetManager  *net.Manager
 	RpcManager  *rpc.Manager
 }
@@ -46,7 +45,7 @@ func (a *Application) GetActorSystem() *actor.ActorSystem {
 	return a.ActorSystem
 }
 func (a *Application) GetCluster() *cluster.Cluster {
-	return a.Cluster
+	return a.RpcManager.GetCluster()
 }
 func (a *Application) GetNetManager() *net.Manager {
 	return a.NetManager
@@ -56,10 +55,10 @@ func (a *Application) GetRpcManager() *rpc.Manager {
 }
 
 func (a *Application) BroadcastEvent(event any, includeSelf bool) {
-	if a.Cluster == nil {
+	if a.RpcManager.GetCluster() == nil {
 		return
 	}
-	a.Cluster.MemberList.BroadcastEvent(event, includeSelf)
+	a.RpcManager.GetCluster().MemberList.BroadcastEvent(event, includeSelf)
 }
 
 func (a *Application) SetNetConfig(config *net.Config) {
@@ -120,7 +119,7 @@ func (a *Application) Start(f func() bool) {
 	}
 	// rpc StartMember 需要先执行 否则net中获取grain会出错
 	if a.RpcManager != nil {
-		a.Cluster = a.RpcManager.Start(a.ActorSystem)
+		a.RpcManager.Start(a.ActorSystem)
 	}
 	// 网络
 	if a.NetManager != nil {

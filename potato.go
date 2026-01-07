@@ -20,7 +20,7 @@ func GetActorSystem() *actor.ActorSystem {
 	return _app.ActorSystem
 }
 func GetCluster() *cluster.Cluster {
-	return _app.Cluster
+	return _app.GetCluster()
 }
 func GetNetManager() *net.Manager {
 	return _app.NetManager
@@ -30,10 +30,10 @@ func GetRpcManager() *rpc.Manager {
 }
 
 func BroadcastEvent(event any, includeSelf bool) {
-	if _app.Cluster == nil {
+	if _app.GetCluster() == nil {
 		return
 	}
-	_app.Cluster.MemberList.BroadcastEvent(event, includeSelf)
+	_app.GetCluster().MemberList.BroadcastEvent(event, includeSelf)
 }
 
 func SetNetConfig(config *net.Config) {
