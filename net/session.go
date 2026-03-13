@@ -1,15 +1,14 @@
 package net
 
 import (
-	"encoding/binary"
 	"errors"
-	"github.com/murang/potato/log"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/murang/potato/log"
 )
 
 type SessionEventType int32
@@ -58,16 +57,15 @@ func (s *Session) Raw() interface{} {
 }
 
 func (s *Session) Close() {
-	state := atomic.LoadInt64(&s.state)
-	if state != 0 {
+	if !atomic.CompareAndSwapInt64(&s.state, 0, 2) {
 		return
 	}
-	atomic.StoreInt64(&s.state, 2)
-	conn := s.Conn()
+	s.connGuard.Lock()
+	conn := s.conn
+	s.connGuard.Unlock()
 	if conn != nil {
-		conn.Close()
 		conn.SetDeadline(time.Now())
-		conn = nil
+		conn.Close()
 	}
 }
 
@@ -109,7 +107,9 @@ func (s *Session) Start() {
 		s.Close()
 		if s.manager.msgHandler != nil && s.manager.msgHandler.IsMsgInRoutine() {
 			s.manager.sessionMap.Delete(s.ID())
-			atomic.AddInt32(&s.manager.sessionCount, -1)
+			s.manager.connMu.Lock()
+			s.manager.sessionCount--
+			s.manager.connMu.Unlock()
 			log.Sugar.Infof("session close: %d", s.ID())
 			s.manager.msgHandler.OnSessionClose(s)
 		} else {
@@ -122,7 +122,9 @@ func (s *Session) Start() {
 
 	if s.manager.msgHandler != nil && s.manager.msgHandler.IsMsgInRoutine() {
 		s.manager.sessionMap.Store(s.ID(), s)
-		atomic.AddInt32(&s.manager.sessionCount, 1)
+		s.manager.connMu.Lock()
+		s.manager.sessionCount++
+		s.manager.connMu.Unlock()
 		log.Sugar.Infof("session open: %d", s.ID())
 		s.manager.msgHandler.OnSessionOpen(s)
 	} else {
@@ -157,7 +159,7 @@ func (s *Session) readLoop() {
 					ip = addr.String()
 				}
 			}
-			if atomic.LoadInt64(&s.state) != 1 || (err.Error() != io.ErrClosedPipe.Error() && !strings.Contains(err.Error(), "use of closed network connection")) {
+			if atomic.LoadInt64(&s.state) != 1 || !isClosedError(err) {
 				log.Sugar.Warnf("session read err, sesid: %d, err: %s ip: %s", s.ID(), err, ip)
 			}
 			s.sendChan <- nil //给写队列传空 用于关闭写队列
@@ -229,7 +231,7 @@ loop:
 		}
 
 		if err := s.sendMessageBytes(msgBytes); err != nil {
-			if atomic.LoadInt64(&s.state) != 1 || (err.Error() != io.ErrClosedPipe.Error() && !strings.Contains(err.Error(), "use of closed network connection")) {
+			if atomic.LoadInt64(&s.state) != 1 || !isClosedError(err) {
 				log.Sugar.Warnf("session sendLoop sendMessage err: sesid: %d, err: %s", s.ID(), err.Error())
 			}
 			break
@@ -247,19 +249,11 @@ func (s *Session) sendMessageBytes(msg []byte) (err error) {
 		}
 	}
 
-	pkt := make([]byte, lenSize+len(msg))
-
-	// Length
-	binary.BigEndian.PutUint32(pkt, uint32(len(msg)))
-
-	// Value
-	copy(pkt[lenSize:], msg)
-
 	writer, ok := s.Raw().(io.Writer)
 
 	// 转换错误，或者连接已经关闭时退出
 	if !ok || writer == nil {
-		return nil
+		return errors.New("writer cast error")
 	}
 
 	err = WritePacket(writer, msg)
@@ -279,4 +273,15 @@ func (s *Session) updateDeadline() (err error) {
 		log.Logger.Error("session flush deadline err")
 	}
 	return
+}
+
+// isClosedError 判断是否是连接已关闭的错误
+func isClosedError(err error) bool {
+	if errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return false
 }

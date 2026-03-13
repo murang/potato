@@ -1,12 +1,13 @@
 package config
 
 import (
-	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/api/watch"
-	"github.com/murang/potato/log"
 	"path/filepath"
 	"reflect"
 	"strings"
+
+	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/api/watch"
+	"github.com/murang/potato/log"
 )
 
 var consulClient *api.Client
@@ -15,6 +16,9 @@ var onConfigChange = make([]func(IConfig), 0)
 // 缓存上一次的 KV 状态，用于检测真正变更的配置
 // key: KV的Key, value: ModifyIndex
 var kvCache = make(map[string]uint64)
+
+// watchPlans 保存所有 watch plan 用于关闭时停止
+var watchPlans []*watch.Plan
 
 // 监听配置更新
 func watchConfigUpdate() {
@@ -26,7 +30,7 @@ func watchConfigUpdate() {
 		}
 	}
 
-	for k, _ := range prefixMap {
+	for k := range prefixMap {
 		params := map[string]interface{}{
 			"type":   "keyprefix",
 			"prefix": k,
@@ -34,6 +38,7 @@ func watchConfigUpdate() {
 		plan, err := watch.Parse(params)
 		if err != nil {
 			log.Sugar.Errorf("watch param parse error:%v", err)
+			continue
 		}
 		plan.Handler = func(idx uint64, data interface{}) {
 			switch d := data.(type) {
@@ -44,11 +49,23 @@ func watchConfigUpdate() {
 			}
 		}
 
-		// 使用带logger的运行方式，可以输出更多调试信息
-		if err = plan.RunWithClientAndHclog(consulClient, nil); err != nil {
-			log.Sugar.Errorf("watchConfigUpdate error:%v", err)
-		}
+		watchPlans = append(watchPlans, plan)
+
+		go func(p *watch.Plan) {
+			// RunWithClientAndHclog 会阻塞直到 plan.Stop() 被调用
+			if err := p.RunWithClientAndHclog(consulClient, nil); err != nil {
+				log.Sugar.Errorf("watchConfigUpdate error:%v", err)
+			}
+		}(plan)
 	}
+}
+
+// StopWatch 停止所有 consul watch goroutine
+func StopWatch() {
+	for _, plan := range watchPlans {
+		plan.Stop()
+	}
+	watchPlans = nil
 }
 
 // 处理配置变更

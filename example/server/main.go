@@ -21,7 +21,7 @@ func main() {
 		MsgHandler:     &MyMsgHandler{},
 	})
 	// 网络监听器 支持tcp/kcp/ws
-	ln, err := net.NewListener("ws", ":10086")
+	ln, err := net.NewListener("tcp", ":10086")
 	if err != nil {
 		panic(err)
 	}

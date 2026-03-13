@@ -77,6 +77,11 @@ func (m *Manager) Start(actorSystem *actor.ActorSystem) (cls *cluster.Cluster) {
 }
 
 func (m *Manager) OnDestroy() {
-	m.cluster.ActorSystem.EventStream.Unsubscribe(m.eventSub)
+	if m.cluster == nil {
+		return
+	}
+	if m.eventSub != nil {
+		m.cluster.ActorSystem.EventStream.Unsubscribe(m.eventSub)
+	}
 	m.cluster.Shutdown(true)
 }

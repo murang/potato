@@ -2,6 +2,7 @@ package net
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -10,6 +11,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/murang/potato/log"
 )
+
+const maxWsBufferSize = 1024 * 1024 // WebSocket 单消息最大 1MB
 
 // server
 type wsListener struct {
@@ -109,6 +112,10 @@ func (w *wsConn) Read(b []byte) (n int, err error) {
 	if err != nil {
 		log.Sugar.Warnf("ws read message error: %v", err)
 		return
+	}
+	// 检查消息大小，防止内存耗尽
+	if len(w.buffer)+len(p) > maxWsBufferSize {
+		return 0, fmt.Errorf("ws buffer overflow: %d bytes", len(w.buffer)+len(p))
 	}
 	// 把p放入buffer
 	w.buffer = append(w.buffer, p...)

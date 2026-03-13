@@ -27,6 +27,7 @@ type Manager struct {
 	idGen            uint64
 	sessionMap       sync.Map
 	sessionCount     int32
+	connMu           sync.Mutex
 	listeners        []IListener
 	codec            ICodec
 	connectLimit     int32
@@ -65,11 +66,15 @@ func NewManagerWithConfig(config *Config) *Manager {
 
 func (sm *Manager) OnNewConnection(conn net.Conn) {
 	if sm.connectLimit > 0 {
-		if atomic.LoadInt32(&sm.sessionCount) >= sm.connectLimit {
+		sm.connMu.Lock()
+		if sm.sessionCount >= sm.connectLimit {
+			sm.connMu.Unlock()
 			log.Sugar.Warnf("connect limit: %d", sm.connectLimit)
 			_ = conn.Close()
 			return
 		}
+		sm.sessionCount++
+		sm.connMu.Unlock()
 	}
 	sess := sm.NewSession(conn)
 	sess.Start()
@@ -103,28 +108,29 @@ func (sm *Manager) Start() {
 		ln.Start()
 	}
 	go func() {
-		for {
-			select {
-			case ses := <-sm.sessionEventChan:
-				switch ses.Type {
-				case SessionOpen:
-					sm.sessionMap.Store(ses.Session.ID(), ses.Session)
-					atomic.AddInt32(&sm.sessionCount, 1)
-					log.Sugar.Infof("session open: %d", ses.Session.ID())
-					if sm.msgHandler != nil {
-						sm.msgHandler.OnSessionOpen(ses.Session)
-					}
-				case SessionClose:
-					sm.sessionMap.Delete(ses.Session.ID())
-					atomic.AddInt32(&sm.sessionCount, -1)
-					log.Sugar.Infof("session close: %d", ses.Session.ID())
-					if sm.msgHandler != nil {
-						sm.msgHandler.OnSessionClose(ses.Session)
-					}
-				case SessionMsg:
-					if sm.msgHandler != nil {
-						sm.msgHandler.OnMsg(ses.Session, ses.Msg)
-					}
+		for ses := range sm.sessionEventChan {
+			switch ses.Type {
+			case SessionOpen:
+				sm.sessionMap.Store(ses.Session.ID(), ses.Session)
+				sm.connMu.Lock()
+				sm.sessionCount++
+				sm.connMu.Unlock()
+				log.Sugar.Infof("session open: %d", ses.Session.ID())
+				if sm.msgHandler != nil {
+					sm.msgHandler.OnSessionOpen(ses.Session)
+				}
+			case SessionClose:
+				sm.sessionMap.Delete(ses.Session.ID())
+				sm.connMu.Lock()
+				sm.sessionCount--
+				sm.connMu.Unlock()
+				log.Sugar.Infof("session close: %d", ses.Session.ID())
+				if sm.msgHandler != nil {
+					sm.msgHandler.OnSessionClose(ses.Session)
+				}
+			case SessionMsg:
+				if sm.msgHandler != nil {
+					sm.msgHandler.OnMsg(ses.Session, ses.Msg)
 				}
 			}
 		}

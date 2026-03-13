@@ -22,7 +22,8 @@ var (
 )
 
 type Application struct {
-	exit     bool
+	exitCh   chan struct{}
+	exitOnce sync.Once
 	name2mod map[string]IModule // ModuleID -> IModule
 	name2pid sync.Map           // ModuleID -> actor PID
 	cancels  []scheduler.CancelFunc
@@ -37,6 +38,7 @@ func NewApplication() *Application {
 		ActorSystem: actor.NewActorSystem(actor.WithLoggerFactory(log.ColoredConsoleLogging)),
 		name2mod:    map[string]IModule{},
 		name2pid:    sync.Map{},
+		exitCh:      make(chan struct{}),
 	}
 	return a
 }
@@ -101,12 +103,18 @@ func (a *Application) Start(f func() bool) {
 		signal.Notify(c, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGILL, syscall.SIGTRAP, syscall.SIGABRT)
 		log.Sugar.Infof("caught signal: %v", <-c)
 		a.Exit()
-		time.Sleep(1 * time.Minute)
-		var buf [65536]byte
-		n := runtime.Stack(buf[:], true)
-		log.Sugar.Errorf("server not stopped in 1 minute, all stack is:\n%s", string(buf[:n]))
-		time.Sleep(2 * time.Second)
-		os.Exit(1)
+
+		// 等待优雅关闭完成或超时
+		select {
+		case <-a.exitCh:
+			// 正常关闭完成
+		case <-time.After(1 * time.Minute):
+			var buf [65536]byte
+			n := runtime.Stack(buf[:], true)
+			log.Sugar.Errorf("server not stopped in 1 minute, all stack is:\n%s", string(buf[:n]))
+			time.Sleep(2 * time.Second)
+			os.Exit(1)
+		}
 	}()
 
 	// 先执行初始化逻辑 再执行集群和网络 否则可能出现网络或者rpc消息过来 但是数据库等等没准备好的情况
@@ -140,17 +148,12 @@ func (a *Application) Run() {
 	sch := scheduler.NewTimerScheduler(a.ActorSystem.Root)
 	for mid, mod := range a.name2mod {
 		if mod.FPS() > 0 {
-			interval := time.Duration(1000/mod.FPS()) * time.Millisecond
+			interval := time.Second / time.Duration(mod.FPS())
 			pid, _ := a.name2pid.Load(mid)
 			a.cancels = append(a.cancels, sch.SendRepeatedly(interval, interval, pid.(*actor.PID), &ModuleUpdate{}))
 		}
 	}
-	for {
-		if a.exit {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	<-a.exitCh
 }
 
 func (a *Application) End(f func()) {
@@ -178,5 +181,7 @@ func (a *Application) End(f func()) {
 }
 
 func (a *Application) Exit() {
-	a.exit = true
+	a.exitOnce.Do(func() {
+		close(a.exitCh)
+	})
 }

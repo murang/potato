@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 )
 
 const (
@@ -16,26 +17,39 @@ var (
 	ErrMinPacket = errors.New("packet short size")
 )
 
+var sizeBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, lenSize)
+		return &b
+	},
+}
+
+var pktBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
+
 // 接收Length-Value格式的封包流程 返回包中的Value
 func ReadPacket(reader io.Reader) (v []byte, err error) {
 
 	// Size为uint32，占4字节
-	var sizeBuffer = make([]byte, lenSize)
+	bp := sizeBufferPool.Get().(*[]byte)
+	sizeBuffer := *bp
 
 	// 持续读取Size直到读到为止
 	_, err = io.ReadFull(reader, sizeBuffer)
 
 	// 发生错误时返回
 	if err != nil {
+		sizeBufferPool.Put(bp)
 		return
-	}
-
-	if len(sizeBuffer) < lenSize {
-		return nil, ErrMinPacket
 	}
 
 	// 用大端格式读取Size
 	bodyLen := binary.BigEndian.Uint32(sizeBuffer)
+	sizeBufferPool.Put(bp)
 
 	if int(bodyLen) > maxPackSize {
 		return nil, ErrMaxPacket
@@ -52,7 +66,16 @@ func ReadPacket(reader io.Reader) (v []byte, err error) {
 
 // 发送Length-Value格式的封包
 func WritePacket(writer io.Writer, msgData []byte) error {
-	pkt := make([]byte, lenSize+len(msgData))
+	totalLen := lenSize + len(msgData)
+
+	bp := pktBufferPool.Get().(*[]byte)
+	pkt := *bp
+
+	if cap(pkt) < totalLen {
+		pkt = make([]byte, totalLen)
+	} else {
+		pkt = pkt[:totalLen]
+	}
 
 	// Length
 	binary.BigEndian.PutUint32(pkt, uint32(len(msgData)))
@@ -61,18 +84,18 @@ func WritePacket(writer io.Writer, msgData []byte) error {
 	copy(pkt[lenSize:], msgData)
 
 	// 将数据写入Socket
-	total := len(pkt)
-
-	for pos := 0; pos < total; {
-
-		n, err := writer.Write(pkt[pos:])
-
-		if err != nil {
-			return err
+	var err error
+	for pos := 0; pos < totalLen; {
+		n, werr := writer.Write(pkt[pos:])
+		if werr != nil {
+			err = werr
+			break
 		}
-
 		pos += n
 	}
 
-	return nil
+	*bp = pkt
+	pktBufferPool.Put(bp)
+
+	return err
 }
