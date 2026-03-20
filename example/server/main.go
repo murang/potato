@@ -1,6 +1,9 @@
 package main
 
 import (
+	"time"
+
+	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/murang/potato"
 	"github.com/murang/potato/log"
 	"github.com/murang/potato/net"
@@ -34,6 +37,9 @@ func main() {
 		Consul:       "0.0.0.0:8500",
 		ServiceKind:  nil, // 当前节点没有service 就不用设置
 		EventHandler: nil, // event stream事件处理器 如果没有订阅事件就不用设置
+		Options: []cluster.ConfigOption{
+			cluster.WithHeartbeatExpiration(time.Hour), // 集群心跳超时
+		},
 	})
 
 	potato.Start(func() bool { // 初始化app 入参为启动函数 在初始化所有组件后执行

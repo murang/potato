@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"fmt"
+
 	"github.com/asynkron/protoactor-go/actor"
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/asynkron/protoactor-go/cluster/clusterproviders/consul"
@@ -14,10 +15,11 @@ import (
 )
 
 type Config struct {
-	ClusterName  string          // 集群名称
-	Consul       string          // 服务发现注册地址
-	ServiceKind  []*cluster.Kind // 使用proto actor grain生成的服务类型
-	EventHandler func(any)       // event处理
+	ClusterName  string                 // 集群名称
+	Consul       string                 // 服务发现注册地址
+	ServiceKind  []*cluster.Kind        // 使用proto actor grain生成的服务类型
+	EventHandler func(any)              // event处理
+	Options      []cluster.ConfigOption // 集群设置
 }
 
 type Manager struct {
@@ -27,6 +29,7 @@ type Manager struct {
 	serviceKinds []*cluster.Kind           // 使用proto actor grain生成的服务类型
 	eventHandler func(any)                 // event stream处理
 	eventSub     *eventstream.Subscription // event stream订阅
+	options      []cluster.ConfigOption
 }
 
 func NewManagerWithConfig(config *Config) *Manager {
@@ -35,6 +38,7 @@ func NewManagerWithConfig(config *Config) *Manager {
 		consul:       config.Consul,
 		serviceKinds: config.ServiceKind,
 		eventHandler: config.EventHandler,
+		options:      config.Options,
 	}
 }
 
@@ -58,13 +62,11 @@ func (m *Manager) Start(actorSystem *actor.ActorSystem) (cls *cluster.Cluster) {
 		return
 	}
 	config := remote.Configure(lanIp, availablePort, remote.WithAdvertisedHost(fmt.Sprintf("%s:%d", lanIp, availablePort)))
-	if m.serviceKinds == nil {
-		clusterConfig := cluster.Configure(m.clusterName, provider, lookup, config)
-		m.cluster = cluster.New(actorSystem, clusterConfig)
-	} else {
-		clusterConfig := cluster.Configure(m.clusterName, provider, lookup, config, cluster.WithKinds(m.serviceKinds...))
-		m.cluster = cluster.New(actorSystem, clusterConfig)
+	if m.serviceKinds != nil {
+		m.options = append(m.options, cluster.WithKinds(m.serviceKinds...))
 	}
+	clusterConfig := cluster.Configure(m.clusterName, provider, lookup, config, m.options...)
+	m.cluster = cluster.New(actorSystem, clusterConfig)
 
 	m.cluster.StartMember()
 
