@@ -39,6 +39,10 @@ func (u *UserConfig) OnLoad() {
 	log.Sugar.Info("load user config end")
 }
 
+func (u *UserConfig) Priority() int {
+	return 666
+}
+
 func (u *UserConfig) GetUserByName(name string) *User {
 	return u.UserMap[name]
 }

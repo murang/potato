@@ -3,6 +3,7 @@ package config
 import (
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/consul/api"
@@ -73,27 +74,38 @@ func handleConfigChanges(pairs api.KVPairs) {
 	// 构建当前 KV 的 key 集合，用于检测删除
 	currentKeys := make(map[string]struct{}, len(pairs))
 
-	// 处理新增或修改的配置
+	// 第一轮：过滤出有效变更的 pairs
+	var validPairs api.KVPairs
 	for _, pair := range pairs {
 		currentKeys[pair.Key] = struct{}{}
 
-		// 检查是否真正变更（通过 ModifyIndex 判断）
 		if lastIndex, exists := kvCache[pair.Key]; exists && lastIndex == pair.ModifyIndex {
-			continue // ModifyIndex 未变，跳过
+			continue
 		}
-
-		// 更新缓存
 		kvCache[pair.Key] = pair.ModifyIndex
 
 		if len(pair.Value) == 0 {
-			continue // 跳过空配置
+			continue
 		}
+		validPairs = append(validPairs, pair)
+	}
 
+	// 按 IPriority 排序：实现了 IPriority 的配置优先加载，按 Priority() 升序
+	sort.SliceStable(validPairs, func(i, j int) bool {
+		pi, hasPi := configPriority(validPairs[i])
+		pj, hasPj := configPriority(validPairs[j])
+		if hasPi && hasPj {
+			return pi < pj
+		}
+		return hasPi && !hasPj
+	})
+
+	// 第二轮：按排序后的顺序加载配置
+	for _, pair := range validPairs {
 		fileName := filepath.Base(pair.Key)
 		fileNameWithoutExt := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 		fileNameBase := strings.Split(fileNameWithoutExt, "_")[0]
 
-		// 分组配置
 		if group := groups[fileNameBase]; group != nil {
 			cfg := reflect.New(group.ConfigType.Elem()).Interface().(IConfig)
 			if LoadConfigFromBytes(pair.Value, cfg) {
@@ -109,11 +121,28 @@ func handleConfigChanges(pairs api.KVPairs) {
 		}
 	}
 
-	// 清理已删除的 key 缓存（可选）
+	// 清理已删除的 key 缓存
 	for key := range kvCache {
 		if _, exists := currentKeys[key]; !exists {
 			delete(kvCache, key)
 			log.Sugar.Infof("config deleted: %s", key)
 		}
 	}
+}
+
+// configPriority 获取 KV pair 对应配置的优先级
+func configPriority(pair *api.KVPair) (int, bool) {
+	fileName := filepath.Base(pair.Key)
+	fileNameWithoutExt := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	fileNameBase := strings.Split(fileNameWithoutExt, "_")[0]
+
+	group := groups[fileNameBase]
+	if group == nil {
+		return 0, false
+	}
+	cfg := reflect.New(group.ConfigType.Elem()).Interface()
+	if p, ok := cfg.(IPriority); ok {
+		return p.Priority(), true
+	}
+	return 0, false
 }
