@@ -73,7 +73,6 @@ func (sm *Manager) OnNewConnection(conn net.Conn) {
 			_ = conn.Close()
 			return
 		}
-		sm.sessionCount++
 		sm.connMu.Unlock()
 	}
 	sess := sm.NewSession(conn)
