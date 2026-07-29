@@ -1,10 +1,11 @@
 package net
 
 import (
-	"github.com/murang/potato/log"
 	"net"
 	"sync"
 	"sync/atomic"
+
+	"github.com/murang/potato/log"
 )
 
 type Config struct {
@@ -69,7 +70,7 @@ func (sm *Manager) OnNewConnection(conn net.Conn) {
 		sm.connMu.Lock()
 		if sm.sessionCount >= sm.connectLimit {
 			sm.connMu.Unlock()
-			log.Sugar.Warnf("connect limit: %d", sm.connectLimit)
+			log.Sugar.Errorf("connect limit: %d", sm.connectLimit)
 			_ = conn.Close()
 			return
 		}
