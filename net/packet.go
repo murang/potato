@@ -51,7 +51,7 @@ func ReadPacket(reader io.Reader) (v []byte, err error) {
 	bodyLen := binary.BigEndian.Uint32(sizeBuffer)
 	sizeBufferPool.Put(bp)
 
-	if int(bodyLen) > maxPackSize {
+	if bodyLen > maxPackSize {
 		return nil, ErrMaxPacket
 	}
 
@@ -66,6 +66,9 @@ func ReadPacket(reader io.Reader) (v []byte, err error) {
 
 // 发送Length-Value格式的封包
 func WritePacket(writer io.Writer, msgData []byte) error {
+	if len(msgData) > maxPackSize {
+		return ErrMaxPacket
+	}
 	totalLen := lenSize + len(msgData)
 
 	bp := pktBufferPool.Get().(*[]byte)
@@ -89,6 +92,10 @@ func WritePacket(writer io.Writer, msgData []byte) error {
 		n, werr := writer.Write(pkt[pos:])
 		if werr != nil {
 			err = werr
+			break
+		}
+		if n == 0 {
+			err = io.ErrShortWrite
 			break
 		}
 		pos += n

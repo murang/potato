@@ -96,3 +96,15 @@ userCfg := config.GetConfig[*UserConfig]()
 // 获取tag配置 第二个参数为true时找不到tag配置时返回默认配置
 priceTagCfg := config.GetConfigWithTag[*PriceConfig]("b", true)
 ```
+
+### Consul 更新与停止
+
+`FocusConsulConfig()` 仍需在 `SetConsul()` 前调用，并使用配置指针注册。`SetConsul()` 保持异步加载，返回时不代表首轮配置已经就绪；读取方需要处理配置尚未加载时的零值（指针类型为 `nil`）。
+
+每个 `Path()` 对应独立的目录前缀，首尾斜杠会被统一处理（例如 `/dream`、`dream` 和 `/dream/` 均匹配 `dream/`）；空路径或 `/` 表示根目录。仅匹配该目录直属的 `.json` 配置。完整 `Name()` 可包含下划线，tag 文件格式仍为 `Name_tag.json`；有多个名称可匹配时，完整名称优先，其次选择最长的已注册名称。不同目录中的同名文件不会相互覆盖。
+
+多前缀的 `OnLoad()` 和变更回调串行执行，可以在回调中读取配置或调用 `StopWatch()`。同一批更新保留 `IPriority` 的加载顺序；关联配置仍是逐个发布，不提供跨表原子快照。无效 JSON 保留上次有效值。
+
+删除 KV 会移除对应的当前配置。删除 tag 后，`GetConfigWithTag(..., true)` 会回退到主配置；主配置也被删除时返回零值。既有配置指针不会被原地修改或失效，业务持有的旧引用需自行重新获取。现有 `OnConsulConfigChange()` 只通知成功加载的配置，不发送删除事件。
+
+`StopWatch()` 取消已登记的监听，允许已经开始的回调完成；它不等待所有回调退出，因而可以在回调内调用。

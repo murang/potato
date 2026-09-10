@@ -2,17 +2,18 @@ package net
 
 import (
 	"context"
-	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/murang/potato/log"
 )
 
-const maxWsBufferSize = 1024 * 1024 // WebSocket 单消息最大 1MB
+const maxWsBufferSize = maxPackSize + lenSize // 包体上限加四字节长度头
 
 // server
 type wsListener struct {
@@ -20,7 +21,8 @@ type wsListener struct {
 	listener        net.Listener
 	server          *http.Server
 	upgrade         *websocket.Upgrader
-	exit            bool
+	exit            atomic.Bool
+	startOnce       sync.Once
 	onNewConnection func(net.Conn)
 }
 
@@ -47,16 +49,24 @@ func newWsListener(addr string) (*wsListener, error) {
 }
 
 func (s *wsListener) Start() {
-	go func() {
-		err := s.server.Serve(s.listener)
-		if err != nil && !s.exit {
-			log.Sugar.Errorf("ws serve error:%v", err)
+	s.startOnce.Do(func() {
+		if s.exit.Load() {
+			return
 		}
-	}()
+		go func() {
+			if err := s.server.Serve(s.listener); err != nil && err != http.ErrServerClosed && !s.exit.Load() {
+				log.Sugar.Errorf("ws serve error:%v", err)
+			}
+		}()
+	})
 }
 
 func (s *wsListener) Stop() {
-	s.exit = true
+	if s.exit.Swap(true) {
+		return
+	}
+	// listener 在构造时已经绑定；尚未 Serve 时 http.Server 不会替我们关闭它。
+	_ = s.listener.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	err := s.server.Shutdown(ctx)
@@ -71,6 +81,10 @@ func (s *wsListener) OnNewConnection(f func(net.Conn)) {
 }
 
 func (s *wsListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.exit.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	if !websocket.IsWebSocketUpgrade(r) { // 如果不是websocket请求 就返回
 		if r.Method == http.MethodHead {
 			// 健康检查逻辑
@@ -81,49 +95,50 @@ func (s *wsListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if s.onNewConnection == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	conn, err := s.upgrade.Upgrade(w, r, nil)
 	if err != nil {
 		log.Sugar.Warnf("Error while upgrading connection:%v", err)
 		return
 	}
 
+	conn.SetReadLimit(maxWsBufferSize)
 	wc := &wsConn{Conn: conn}
 	go s.onNewConnection(wc)
 }
 
 type wsConn struct {
-	buffer []byte
+	reader io.Reader
 	*websocket.Conn
 	mu sync.Mutex
 }
 
 // 实现Conn接口
-func (w *wsConn) Read(b []byte) (n int, err error) {
-	// 先从buffer中读取
-	if len(w.buffer) > 0 {
-		n = copy(b, w.buffer)
-		w.buffer = w.buffer[n:]
-		// 写满b就返回
-		if n == len(b) {
-			return
+func (w *wsConn) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	for {
+		if w.reader == nil {
+			_, reader, err := w.Conn.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			w.reader = reader
 		}
+		n, err := w.reader.Read(b)
+		if err == io.EOF {
+			w.reader = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
 	}
-	_, p, err := w.Conn.ReadMessage()
-	if err != nil {
-		log.Sugar.Warnf("ws read message error: %v", err)
-		return
-	}
-	// 检查消息大小，防止内存耗尽
-	if len(w.buffer)+len(p) > maxWsBufferSize {
-		return 0, fmt.Errorf("ws buffer overflow: %d bytes", len(w.buffer)+len(p))
-	}
-	// 把p放入buffer
-	w.buffer = append(w.buffer, p...)
-	// 把buffer中的数据拷贝到b
-	nn := copy(b[n:], w.buffer)
-	w.buffer = w.buffer[nn:]
-	n += nn
-	return
 }
 
 func (w *wsConn) Write(b []byte) (n int, err error) {
@@ -136,11 +151,16 @@ func (w *wsConn) Write(b []byte) (n int, err error) {
 	return len(b), nil
 }
 
-func (w *wsConn) SetDeadline(t time.Time) (err error) {
-	err = w.Conn.SetReadDeadline(t)
-	if err != nil {
-		return
+// 与 WriteMessage 串行设置 gorilla 的写 deadline；Close 无需该锁，可中断阻塞写入。
+func (w *wsConn) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Conn.SetWriteDeadline(t)
+}
+
+func (w *wsConn) SetDeadline(t time.Time) error {
+	if err := w.Conn.SetReadDeadline(t); err != nil {
+		return err
 	}
-	err = w.Conn.SetWriteDeadline(t)
-	return err
+	return w.SetWriteDeadline(t)
 }

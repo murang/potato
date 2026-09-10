@@ -41,9 +41,9 @@ func main() {
   // potato可以注册多个模块 每个模块有自己的帧率 帧率设置为0的话就是不tick
   potato.RegisterModule(&NiceModule{})
 
-  // 初始化app 入参为启动函数 在初始化所有组件后执行
-  potato.Start(func() bool { // 初始化app 入参为启动函数 在初始化所有组件后执行
-    log.Logger.Info("all module started, server start")
+  // 先初始化数据库等基础资源，再启动 RPC、网络和模块
+  potato.Start(func() bool {
+    log.Logger.Info("resources initialized, starting server")
     return true
   })
   potato.Run()        // 开始update 所有组件开始tick 主线程阻塞
@@ -52,6 +52,9 @@ func main() {
   })
 }
 ```
+
+`Application.Exit()` 表示请求退出；`End()` 会停止网络接入、关闭现有会话并等待网络回调，再处理模块停止前已排队的消息和 `OnDestroy()`，最后关闭 RPC 并执行完成回调。`End()` 可重复调用，清理及完成回调只执行一次。请像上面的示例一样在主生命周期协程调用 `End()`；在模块或网络回调中同步调用会等待回调自身，持有 Application 实例的业务回调需要退出时应调用其 `Exit()` 方法。
+
 模块需要实现IModule接口
 ```go
 type NiceModule struct {}
@@ -104,6 +107,12 @@ potato.GetNetManager().AddListener(ln)
 ```
 
 ⚠️⚠️⚠️ 网络消息按照 `[消息体长度(4字节)] + [消息体]` 为一个数据包来发送 这个4字节的长度默认`大端序` ⚠️⚠️⚠️
+
+消息体上限为 1 MiB，长度头不计入包体上限。TCP、KCP 和 WebSocket 使用同一包格式；WebSocket 单条消息上限包含额外的 4 字节长度头。超长包和不完整的 Protobuf 消息 ID 会返回错误并关闭对应会话。
+
+`Send()` 与 `SendRaw()` 共用发送队列，同一调用方依次发送的消息保持入队顺序；队列满时仍会等待，`Close()` 会解除等待并中断连接读写。`SendRaw()` 会复制切片，返回后可复用原数据；`Send()` 的消息对象在编码完成前仍需由调用方保证不被修改。发送方法保持原有的无返回值签名，不表示对端已收到消息。
+
+会话接入时确定消息处理器及 `IsMsgInRoutine()` 模式；后续 `SetMsgHandler()` 影响新会话。`Manager.OnDestroy()` 会等待现有会话及回调完成，应从管理生命周期的协程调用。业务回调可以直接调用 `Session.Close()`。
 
 消息处理器实现IMsgHandler
 ```go
@@ -217,6 +226,7 @@ potato.BroadcastEvent(&nice.EventHello{SayHello: "niceman"}, false) // 第二个
     - 日志输出用到了大名鼎鼎的zap，持久化日志通过lumberjack实现。
     - 不进行任何设置的话 默认输出到标准输出。通过InitLogger进行设置，可实现自定义日志级别，保存文件夹，保存天数等等。
     - webhook用于服务器报错通知到飞书，钉钉等。
+    - webhook 通知采用尽力投递，队列满时丢弃通知，普通日志仍照常记录，业务协程不等待通知服务。
 
 * config
   - 配置读取 详细可以参考[config](https://github.com/murang/potato/tree/main/config/README.md)

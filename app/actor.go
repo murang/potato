@@ -13,7 +13,8 @@ type ModuleOnRequest struct {
 }
 
 type moduleActor struct {
-	module IModule
+	module  IModule
+	stopped chan struct{}
 }
 
 func (m *moduleActor) Receive(ctx actor.Context) {
@@ -24,6 +25,10 @@ func (m *moduleActor) Receive(ctx actor.Context) {
 		m.module.OnUpdate()
 	case *actor.Stopping:
 		m.module.OnDestroy()
+	case *actor.Stopped:
+		if m.stopped != nil {
+			close(m.stopped)
+		}
 	case *ModuleOnMsg:
 		m.module.OnMsg(msg.Msg)
 	case *ModuleOnRequest:

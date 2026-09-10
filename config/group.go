@@ -7,6 +7,8 @@ import (
 
 var groups = make(map[string]*Group)
 
+var registryMu sync.RWMutex
+
 type Group struct {
 	Name       string
 	Path       string

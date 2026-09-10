@@ -4,6 +4,8 @@ import (
 	"github.com/murang/potato/log"
 	"github.com/xtaci/kcp-go"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,7 +13,8 @@ import (
 type kcpListener struct {
 	addr            string
 	listener        net.Listener
-	exit            bool
+	exit            atomic.Bool
+	startOnce       sync.Once
 	onNewConnection func(net.Conn)
 }
 
@@ -30,11 +33,17 @@ func newKcpListener(addr string) (*kcpListener, error) {
 }
 
 func (s *kcpListener) Start() {
-	go s.accept()
+	s.startOnce.Do(func() {
+		if !s.exit.Load() {
+			go s.accept()
+		}
+	})
 }
 
 func (s *kcpListener) Stop() {
-	s.exit = true
+	if s.exit.Swap(true) {
+		return
+	}
 	err := s.listener.Close()
 	if err != nil {
 		log.Sugar.Errorf("close kcp listener error: %v", err)
@@ -54,14 +63,15 @@ func (s *kcpListener) accept() {
 				time.Sleep(time.Millisecond)
 				continue
 			}
-			if s.exit {
+			if s.exit.Load() {
 				break
 			}
 			// 调试状态时, 才打出accept的具体错误
 			log.Sugar.Errorf("kcp.accept failed: %v", err.Error())
 			break
 		} else {
-			if s.exit {
+			if s.exit.Load() {
+				_ = conn.Close()
 				break
 			}
 			if s.onNewConnection == nil {

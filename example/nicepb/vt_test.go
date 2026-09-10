@@ -177,7 +177,7 @@ func BenchmarkTypeAssertVT(b *testing.B) {
 
 // 类型断言 + 注册表调用
 func BenchmarkRegistryVT(b *testing.B) {
-	vt.Register[*nice.C2S_Complex]() // 确保注册一次
+	vt.Register(&nice.C2S_Complex{}) // 确保注册一次
 
 	for i := 0; i < b.N; i++ {
 		var u nice.C2S_Complex

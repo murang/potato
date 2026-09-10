@@ -53,6 +53,9 @@ func (c *PbCodec) Encode(v interface{}) (msgBytes []byte, err error) {
 }
 
 func (c *PbCodec) Decode(data []byte) (msg interface{}, err error) {
+	if len(data) < lenMsgId {
+		return nil, ErrMinPacket
+	}
 	// 取出消息id
 	msgId := binary.BigEndian.Uint32(data)
 	msgType := pb.GetTypeById(msgId)

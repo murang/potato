@@ -22,11 +22,15 @@ var (
 )
 
 type Application struct {
-	exitCh   chan struct{}
-	exitOnce sync.Once
-	name2mod map[string]IModule // ModuleID -> IModule
-	name2pid sync.Map           // ModuleID -> actor PID
-	cancels  []scheduler.CancelFunc
+	exitCh       chan struct{}
+	exitOnce     sync.Once
+	endOnce      sync.Once
+	shutdownDone chan struct{}
+	moduleDone   sync.Map
+	cancelsMu    sync.Mutex
+	name2mod     map[string]IModule // ModuleID -> IModule
+	name2pid     sync.Map           // ModuleID -> actor PID
+	cancels      []scheduler.CancelFunc
 
 	ActorSystem *actor.ActorSystem
 	NetManager  *net.Manager
@@ -35,10 +39,11 @@ type Application struct {
 
 func NewApplication() *Application {
 	a := &Application{
-		ActorSystem: actor.NewActorSystem(actor.WithLoggerFactory(log.ColoredConsoleLogging)),
-		name2mod:    map[string]IModule{},
-		name2pid:    sync.Map{},
-		exitCh:      make(chan struct{}),
+		ActorSystem:  actor.NewActorSystem(actor.WithLoggerFactory(log.ColoredConsoleLogging)),
+		name2mod:     map[string]IModule{},
+		name2pid:     sync.Map{},
+		exitCh:       make(chan struct{}),
+		shutdownDone: make(chan struct{}),
 	}
 	return a
 }
@@ -47,6 +52,9 @@ func (a *Application) GetActorSystem() *actor.ActorSystem {
 	return a.ActorSystem
 }
 func (a *Application) GetCluster() *cluster.Cluster {
+	if a.RpcManager == nil {
+		return nil
+	}
 	return a.RpcManager.GetCluster()
 }
 func (a *Application) GetNetManager() *net.Manager {
@@ -57,10 +65,9 @@ func (a *Application) GetRpcManager() *rpc.Manager {
 }
 
 func (a *Application) BroadcastEvent(event any, includeSelf bool) {
-	if a.RpcManager.GetCluster() == nil {
-		return
+	if cluster := a.GetCluster(); cluster != nil {
+		cluster.MemberList.BroadcastEvent(event, includeSelf)
 	}
-	a.RpcManager.GetCluster().MemberList.BroadcastEvent(event, includeSelf)
 }
 
 func (a *Application) SetNetConfig(config *net.Config) {
@@ -97,22 +104,23 @@ func (a *Application) RequestToModule(modName string, msg interface{}) (interfac
 }
 
 func (a *Application) Start(f func() bool) {
-	// catch signal
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGILL, syscall.SIGTRAP, syscall.SIGABRT)
 	go func() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGILL, syscall.SIGTRAP, syscall.SIGABRT)
-		log.Sugar.Infof("caught signal: %v", <-c)
-		a.Exit()
-
-		// 等待优雅关闭完成或超时
+		defer signal.Stop(c)
 		select {
+		case sig := <-c:
+			log.Sugar.Infof("caught signal: %v", sig)
+			a.Exit()
 		case <-a.exitCh:
-			// 正常关闭完成
-		case <-time.After(1 * time.Minute):
+		case <-a.shutdownDone:
+			return
+		}
+		if !a.waitForShutdown(time.Minute) {
 			var buf [65536]byte
 			n := runtime.Stack(buf[:], true)
 			log.Sugar.Errorf("server not stopped in 1 minute, all stack is:\n%s", string(buf[:n]))
-			time.Sleep(2 * time.Second)
+			_ = log.Logger.Sync()
 			os.Exit(1)
 		}
 	}()
@@ -135,8 +143,10 @@ func (a *Application) Start(f func() bool) {
 	}
 
 	for mid, mod := range a.name2mod {
+		done := make(chan struct{})
+		a.moduleDone.Store(mid, done)
 		props := actor.PropsFromProducer(func() actor.Actor {
-			return &moduleActor{module: mod.(IModule)}
+			return &moduleActor{module: mod, stopped: done}
 		})
 		pid := a.ActorSystem.Root.Spawn(props)
 		a.name2pid.Store(mid, pid)
@@ -145,6 +155,13 @@ func (a *Application) Start(f func() bool) {
 }
 
 func (a *Application) Run() {
+	a.cancelsMu.Lock()
+	select {
+	case <-a.exitCh:
+		a.cancelsMu.Unlock()
+		return
+	default:
+	}
 	sch := scheduler.NewTimerScheduler(a.ActorSystem.Root)
 	for mid, mod := range a.name2mod {
 		if mod.FPS() > 0 {
@@ -153,35 +170,61 @@ func (a *Application) Run() {
 			a.cancels = append(a.cancels, sch.SendRepeatedly(interval, interval, pid.(*actor.PID), &ModuleUpdate{}))
 		}
 	}
+	a.cancelsMu.Unlock()
 	<-a.exitCh
 }
 
+// End 从应用生命周期协程调用，等待网络回调和模块清理后再执行完成回调。
 func (a *Application) End(f func()) {
-	// 网络
-	if a.NetManager != nil {
-		a.NetManager.OnDestroy()
-	}
-	// rpc
-	if a.RpcManager != nil {
-		a.RpcManager.OnDestroy()
-	}
+	a.endOnce.Do(func() {
+		a.Exit()
+		a.cancelsMu.Lock()
+		for _, cancel := range a.cancels {
+			cancel()
+		}
+		a.cancels = nil
+		a.cancelsMu.Unlock()
 
-	for _, cancel := range a.cancels {
-		cancel()
-	}
-	a.name2pid.Range(func(key, value interface{}) bool {
-		a.ActorSystem.Root.Stop(value.(*actor.PID))
-		return true
+		if a.NetManager != nil {
+			a.NetManager.OnDestroy()
+		}
+		// 停止新的网络事件后，按 mailbox 顺序完成已接受的模块消息，再清理模块。
+		a.name2pid.Range(func(_, value interface{}) bool {
+			a.ActorSystem.Root.Poison(value.(*actor.PID))
+			return true
+		})
+		a.moduleDone.Range(func(_, value interface{}) bool {
+			<-value.(chan struct{})
+			return true
+		})
+		// 模块 OnDestroy 期间仍可使用 RPC。
+		if a.RpcManager != nil {
+			a.RpcManager.OnDestroy()
+		}
+		if !a.ActorSystem.IsStopped() {
+			a.ActorSystem.Shutdown()
+		}
+		if f != nil {
+			f()
+		}
+		_ = log.Logger.Sync()
+		close(a.shutdownDone)
 	})
-	if f != nil {
-		f()
-	}
-	_ = log.Logger.Sync()
-	time.Sleep(1 * time.Second)
 }
 
 func (a *Application) Exit() {
 	a.exitOnce.Do(func() {
 		close(a.exitCh)
 	})
+}
+
+func (a *Application) waitForShutdown(timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-a.shutdownDone:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

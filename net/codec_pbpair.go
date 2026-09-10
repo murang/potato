@@ -41,6 +41,9 @@ func (c *PbPairCodec) Encode(v interface{}) (msgBytes []byte, err error) {
 }
 
 func (c *PbPairCodec) Decode(data []byte) (msg interface{}, err error) {
+	if len(data) < lenMsgId {
+		return nil, ErrMinPacket
+	}
 	// 取出消息id
 	msgId := binary.BigEndian.Uint32(data)
 	msgType := pb.GetC2STypeById(msgId) // 和PbCodec不一样 这里需要区别是c2s还是s2c
