@@ -4,40 +4,51 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/murang/potato/log"
 )
 
 type Config struct {
-	SessionStartId uint64      // 会话起始 ID
-	ConnectLimit   int32       // 最大并发连接数
-	Timeout        int32       // 超时，单位秒
-	Codec          ICodec      // 未设置时使用 JSON
-	MsgHandler     IMsgHandler // 消息处理器
+	SessionStartId       uint64        // 会话起始 ID
+	ConnectLimit         int32         // 最大并发连接数
+	Timeout              int32         // 超时，单位秒
+	Codec                ICodec        // 未设置时使用 JSON
+	MsgHandler           IMsgHandler   // 消息处理器
+	SendQueueLimit       int           // 排队消息上限，不含正在写入的消息；<=0 使用 4096
+	SendQueueIdleTimeout time.Duration // 扩容队列的空闲缩容时间；<=0 使用 30 秒
 }
 
 func defaultConfig() *Config {
-	return &Config{ConnectLimit: 50000, Timeout: 30, Codec: &JsonCodec{}}
+	return &Config{
+		ConnectLimit:         50000,
+		Timeout:              30,
+		Codec:                &JsonCodec{},
+		SendQueueLimit:       defaultSendQueueLimit,
+		SendQueueIdleTimeout: defaultSendQueueIdleTimeout,
+	}
 }
 
 type Manager struct {
-	idGen            uint64
-	sessionMap       sync.Map
-	sessionCount     int32
-	connMu           sync.Mutex // 保护准入、计数、监听器和处理器配置
-	listeners        []IListener
-	codec            ICodec
-	connectLimit     int32
-	timeout          int32
-	sessionEventChan chan *SessionEvent
-	msgHandler       IMsgHandler
-	started          bool
-	stopping         bool
-	startOnce        sync.Once
-	stopOnce         sync.Once
-	eventOnce        sync.Once
-	eventsDone       chan struct{}
-	sessions         sync.WaitGroup
+	idGen                uint64
+	sessionMap           sync.Map
+	sessionCount         int32
+	connMu               sync.Mutex // 保护准入、计数、监听器和处理器配置
+	listeners            []IListener
+	codec                ICodec
+	connectLimit         int32
+	timeout              int32
+	sendQueueLimit       int
+	sendQueueIdleTimeout time.Duration
+	sessionEventChan     chan *SessionEvent
+	msgHandler           IMsgHandler
+	started              bool
+	stopping             bool
+	startOnce            sync.Once
+	stopOnce             sync.Once
+	eventOnce            sync.Once
+	eventsDone           chan struct{}
+	sessions             sync.WaitGroup
 }
 
 func NewManager() *Manager { return NewManagerWithConfig(defaultConfig()) }
@@ -47,13 +58,15 @@ func NewManagerWithConfig(config *Config) *Manager {
 		config = defaultConfig()
 	}
 	m := &Manager{
-		idGen:            config.SessionStartId,
-		codec:            config.Codec,
-		connectLimit:     config.ConnectLimit,
-		timeout:          config.Timeout,
-		msgHandler:       config.MsgHandler,
-		sessionEventChan: make(chan *SessionEvent, 1024),
-		eventsDone:       make(chan struct{}),
+		idGen:                config.SessionStartId,
+		codec:                config.Codec,
+		connectLimit:         config.ConnectLimit,
+		timeout:              config.Timeout,
+		msgHandler:           config.MsgHandler,
+		sendQueueLimit:       config.SendQueueLimit,
+		sendQueueIdleTimeout: config.SendQueueIdleTimeout,
+		sessionEventChan:     make(chan *SessionEvent, 1024),
+		eventsDone:           make(chan struct{}),
 	}
 	if m.codec == nil {
 		m.codec = &JsonCodec{}
@@ -63,6 +76,12 @@ func NewManagerWithConfig(config *Config) *Manager {
 	}
 	if m.timeout <= 0 {
 		m.timeout = 30
+	}
+	if m.sendQueueLimit <= 0 {
+		m.sendQueueLimit = defaultSendQueueLimit
+	}
+	if m.sendQueueIdleTimeout <= 0 {
+		m.sendQueueIdleTimeout = defaultSendQueueIdleTimeout
 	}
 	return m
 }
@@ -93,13 +112,15 @@ func (sm *Manager) SetMsgHandler(handler IMsgHandler) {
 }
 
 func (sm *Manager) NewSession(conn net.Conn) *Session {
-	return &Session{
-		manager:  sm,
-		id:       atomic.AddUint64(&sm.idGen, 1),
-		conn:     conn,
-		outgoing: make(chan outgoingMessage, 64),
-		done:     make(chan struct{}),
+	s := &Session{
+		manager:      sm,
+		id:           atomic.AddUint64(&sm.idGen, 1),
+		conn:         conn,
+		outgoing:     make([]outgoingMessage, min(initialOutgoingCapacity, sm.sendQueueLimit)),
+		outgoingWake: make(chan struct{}, 1),
+		done:         make(chan struct{}),
 	}
+	return s
 }
 
 // admit 在启动任何会话回调前预留名额。关闭过程与 WaitGroup.Add 使用同一把锁。

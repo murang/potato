@@ -94,11 +94,13 @@ func (n *NiceModule) OnRequest(msg interface{}) interface{} {
 设置网络监听：
 ```go
 potato.SetNetConfig(&net.Config{
-		SessionStartId: 0,
-		ConnectLimit:   1000,
-		Timeout:        30,
-		Codec:          &net.PbCodec{}, // 框架内置JsonCodec和PbCodec 可以实现ICodec接口来实现自定义消息编解码
-		MsgHandler:     &MyMsgHandler{}, // 需要用户自己实现IMsgHandler 用于处理消息
+		SessionStartId:       0,
+		ConnectLimit:         1000,
+		Timeout:              30,
+		Codec:                &net.PbCodec{},    // 框架内置JsonCodec和PbCodec，可以实现ICodec接口来定制编解码
+		MsgHandler:           &MyMsgHandler{}, // 需要用户自己实现IMsgHandler，用于处理消息
+		SendQueueLimit:       4096,             // 未出队消息的上限，超过时关闭连接
+		SendQueueIdleTimeout: 30 * time.Second, // 扩大的发送队列空闲多久后缩回初始容量
 	})
 // 网络监听器 支持tcp/kcp/ws
 ln, _ := net.NewListener("tcp", ":10086")
@@ -110,7 +112,11 @@ potato.GetNetManager().AddListener(ln)
 
 消息体上限为 1 MiB，长度头不计入包体上限。TCP、KCP 和 WebSocket 使用同一包格式；WebSocket 单条消息上限包含额外的 4 字节长度头。超长包和不完整的 Protobuf 消息 ID 会返回错误并关闭对应会话。
 
-`Send()` 与 `SendRaw()` 共用发送队列，同一调用方依次发送的消息保持入队顺序；队列满时仍会等待，`Close()` 会解除等待并中断连接读写。`SendRaw()` 会复制切片，返回后可复用原数据；`Send()` 的消息对象在编码完成前仍需由调用方保证不被修改。发送方法保持原有的无返回值签名，不表示对端已收到消息。
+`Send()` 与 `SendRaw()` 共用按需扩容的环形 FIFO 发送队列，初始容量为 64 条（上限小于 64 时使用该上限），同一调用方依次发送的消息保持入队顺序。发送调用只在内存队列操作期间持有互斥锁，不等待队列空位、编码或网络写入。`SendQueueLimit` 默认 4096，限制尚未出队的消息数量，不包含 writer 已取出的那一条；队列已经达到上限时，下一次发送会立即关闭该会话并丢弃积压消息。环形队列复用出队槽位，底层容量也不超过配置上限。
+
+出队时立即清除消息引用；扩大的队列清空后保留容量，连续空闲达到 `SendQueueIdleTimeout`（默认 30 秒）才缩回初始容量，新一轮发送会重新开始空闲计时。writer 只在需要缩容时启用并复用一个计时器，不为每条消息创建计时器或额外的缩容协程。`Close()` 中断连接读写、释放整个队列并唤醒等待消息的 writer。两个队列配置为零或负数时使用默认值，读写超时仍由 `Timeout` 控制。队列上限按条数计算，消息大小和空闲窗口内保留的槽位容量仍需计入内存预算。
+
+`SendRaw()` 会复制切片，返回后可复用原数据；`Send()` 的消息对象在编码完成前仍需由调用方保证不被修改。发送方法保持原有的无返回值签名，关闭后的发送会被忽略，返回不表示对端已收到消息。
 
 会话接入时确定消息处理器及 `IsMsgInRoutine()` 模式；后续 `SetMsgHandler()` 影响新会话。`Manager.OnDestroy()` 会等待现有会话及回调完成，应从管理生命周期的协程调用。业务回调可以直接调用 `Session.Close()`。
 

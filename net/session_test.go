@@ -2,6 +2,7 @@ package net
 
 import (
 	stdnet "net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,10 +17,11 @@ type testHandler struct {
 	message func(*Session, any)
 }
 
-func TestCloseUnblocksFullSendQueue(t *testing.T) {
+func TestSendQueueGrowsUntilLimitWithoutBlocking(t *testing.T) {
 	for _, raw := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
 			s := NewManager().NewSession(nil)
+			defer s.Close()
 			send := func() {
 				if raw {
 					s.SendRaw([]byte(`{}`))
@@ -27,47 +29,98 @@ func TestCloseUnblocksFullSendQueue(t *testing.T) {
 					s.Send(1)
 				}
 			}
-			for i := 0; i < cap(s.outgoing); i++ {
+			burst := cap(s.outgoing)*4 + 1
+			done := make(chan struct{})
+			go func() {
+				for i := 0; i < burst; i++ {
+					send()
+				}
+				close(done)
+			}()
+			synctest.Wait()
+			select {
+			case <-done:
+			default:
+				t.Fatal("send burst blocked the sender")
+			}
+			if s.IsClosed() || s.outgoingLen != burst {
+				t.Fatal("send burst closed the session or dropped queued messages")
+			}
+			for i := burst; i < s.manager.sendQueueLimit; i++ {
 				send()
 			}
-			done := make(chan struct{})
-			go func() { send(); close(done) }()
-			synctest.Wait()
-			select {
-			case <-done:
-				t.Fatal("queue did not apply backpressure")
-			default:
+			if s.IsClosed() || s.outgoingLen != s.manager.sendQueueLimit || cap(s.outgoing) > s.manager.sendQueueLimit {
+				t.Fatal("queue did not retain exactly the configured limit")
 			}
-			s.Close()
-			synctest.Wait()
-			select {
-			case <-done:
-			default:
-				t.Fatal("close did not unblock sender")
+			send()
+			if !s.IsClosed() {
+				t.Fatal("sending beyond the queue limit did not close the session")
+			}
+			send()
+			if len(s.outgoing) != 0 || s.outgoingLen != 0 {
+				t.Fatal("closed session retained queued messages")
 			}
 		})
 	}
 }
 
 func TestSendAndSendRawPreserveOrderAndOwnRawBytes(t *testing.T) {
-	m := NewManager()
-	defer m.OnDestroy()
-	a, b := stdnet.Pipe()
-	defer b.Close()
-	s := m.NewSession(a)
-	s.Send(1)
-	raw := []byte(`2`)
-	s.SendRaw(raw)
-	raw[0] = '9'
-	s.Send(3)
-	s.Start()
-	for _, want := range []string{"1", "2", "3"} {
+	synctest.Test(t, func(t *testing.T) {
+		m := NewManagerWithConfig(&Config{Timeout: 3600})
+		defer m.OnDestroy()
+		a, b := stdnet.Pipe()
+		defer b.Close()
+		s := m.NewSession(a)
+		capacity := func() int {
+			s.outgoingMu.Lock()
+			defer s.outgoingMu.Unlock()
+			return cap(s.outgoing)
+		}
+		// 超过初始容量的混合消息，验证扩容后仍保持顺序并拥有原始字节。
+		const burst = 257
+		for i := 0; i < burst; i++ {
+			if i%2 == 0 {
+				s.Send(i)
+			} else {
+				raw := []byte(strconv.Itoa(i))
+				s.SendRaw(raw)
+				raw[0] = 'x'
+			}
+		}
+		s.Start()
+		for i := 0; i < burst; i++ {
+			want := strconv.Itoa(i)
+			_ = b.SetReadDeadline(time.Now().Add(time.Second))
+			got, err := ReadPacket(b)
+			if err != nil || string(got) != want {
+				t.Fatalf("got %q/%v, want %q", got, err, want)
+			}
+		}
+		synctest.Wait()
+		if capacity() <= initialOutgoingCapacity {
+			t.Fatal("queue shrank immediately after the burst")
+		}
+		// 30 秒空闲窗口内的新消息必须重新开始计时，防止旧计时器
+		// 把刚恢复发送的队列提前缩小。虚拟时间让检查不依赖真实等待。
+		time.Sleep(29 * time.Second)
+		s.Send(burst)
 		_ = b.SetReadDeadline(time.Now().Add(time.Second))
 		got, err := ReadPacket(b)
-		if err != nil || string(got) != want {
-			t.Fatalf("got %q/%v, want %q", got, err, want)
+		if err != nil || string(got) != strconv.Itoa(burst) {
+			t.Fatalf("follow-up packet=%q/%v", got, err)
 		}
-	}
+		synctest.Wait()
+		time.Sleep(29 * time.Second)
+		synctest.Wait()
+		if capacity() <= initialOutgoingCapacity {
+			t.Fatal("queue shrank before the renewed idle deadline")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if s.IsClosed() || capacity() != initialOutgoingCapacity {
+			t.Fatal("idle queue did not shrink while keeping the session alive")
+		}
+	})
 }
 
 func TestConcurrentAdmissionAndShutdown(t *testing.T) {
