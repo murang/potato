@@ -29,10 +29,10 @@ var msgDispatcher = map[reflect.Type]func(agent *Agent, msg proto.Message){
 }
 
 func Hello(agent *Agent, msg *nice.C2S_Hello) {
-	resp, err := potato.RequestToModule[*NiceModule](msg.Name) // 发消息到其他模块去处理逻辑
-	if err != nil {
-		log.Sugar.Errorf("request to module failed: %v", err)
-		return
+	// The global network dispatcher only routes. Waiting here would block every
+	// session behind one slow RPC. The module owns the per-session request state.
+	if err := potato.TrySendToModule[*NiceModule](helloRequest{session: agent.session, name: msg.Name}); err != nil {
+		log.Sugar.Warnf("hello rejected: %v", err)
+		agent.session.Close()
 	}
-	agent.session.Send(&nice.S2C_Hello{SayHi: resp.(string)})
 }

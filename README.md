@@ -41,7 +41,7 @@ func main() {
   // potato可以注册多个模块 每个模块有自己的帧率 帧率设置为0的话就是不tick
   potato.RegisterModule(&NiceModule{})
 
-  // 先初始化数据库等基础资源，再启动 RPC、网络和模块
+  // 先初始化数据库等基础资源，再按注册顺序初始化模块，最后启动 RPC 和网络
   potato.Start(func() bool {
     log.Logger.Info("resources initialized, starting server")
     return true
@@ -53,7 +53,19 @@ func main() {
 }
 ```
 
-`Application.Exit()` 表示请求退出；`End()` 会停止网络接入、关闭现有会话并等待网络回调，再处理模块停止前已排队的消息和 `OnDestroy()`，最后关闭 RPC 并执行完成回调。`End()` 可重复调用，清理及完成回调只执行一次。请像上面的示例一样在主生命周期协程调用 `End()`；在模块或网络回调中同步调用会等待回调自身，持有 Application 实例的业务回调需要退出时应调用其 `Exit()` 方法。
+`Start()` 先登记全部模块 PID，再按注册顺序等待各模块 `OnStart()`，全部就绪后才启动 RPC 和网络。依赖模块先注册；初始化中只调用已经就绪的依赖，不同步请求自身、不调用尚未启动的 RPC。异步配置加载仍需业务等待就绪或处理 `nil`。`StartWithError()`、`StartContext()` 可显式处理启动错误；旧 `Start()` 保留签名，失败时记录错误并请求退出。`Err()` 返回应用失败原因。
+
+`Application.Exit()`（或 `potato.Exit()`）表示请求退出；`End()` 停止 tick、关闭网络并等待回调，随后停止 RPC 入站业务，再按注册逆序等待每个模块的已接受消息和受管异步任务完成，执行 `OnDestroy()`，最后关闭 RPC。普通跨模块依赖需从后注册模块指向先注册模块；业务自行启动的生产者要先停止或纳入任务登记。RPC 出站 transport 在模块清理期间保留，但路由回本节点的 grain 会被入站门控拒绝，RPC 的 `Terminate` 不得依赖已停止模块。
+
+`End()` 可重复调用，清理及完成回调只执行一次。它应从生命周期协程调用，在模块、网络或 RPC 回调中同步调用会等待自身。业务排空不等于发送队列排空或客户端收到消息。模块 panic 后停止失败实例并请求应用退出，不再自动重跑同一实例的 `OnStart()`；检查 `Err()` 区分失败退出与正常排空，示例 server 在失败时返回非零退出码。
+
+模块默认最多接受 1024 条普通消息（包含正在执行的一条），最多 32 个异步任务或待消费结果。可用 `RegisterModuleWithOptions(..., app.ModuleOptions{QueueLimit: 1024, MaxAsync: 32})` 调整。原 `SendToModule()` 保留无返回值签名，拒绝时限频记录；关键业务使用 `TrySendToModule()` 处理 `ErrBusy`、`ErrNotReady`、`ErrStopping` 等错误，`ModuleStats()` 可读取计数。直接通过 `ActorSystem` 投递会绕过这些保证。
+
+`RequestToModuleContext()` 在执行前跳过已过期请求；旧 `RequestToModule()` 保留 1 秒默认超时和 `actor.ErrTimeout`。超时不撤销已经执行的业务，写操作重试仍需幂等。`OnUpdate()` 最多保留一个未完成 tick，过载时跳过后续 tick，不补跑全部过期帧。
+
+网络消息处理器应只路由消息，避免在全局分发回调中同步等待 RPC。`TryAsyncToModule()` 非阻塞申请任务额度，让 `work func() any` 在后台执行，并把返回的消息交回模块 `OnMsg()`；worker 只能操作不可变输入，不能修改模块字段。额度持续到结果消费完成，普通队列已满也不会丢完成消息。当前 Hello 示例没有请求 ID，同一会话只允许一个未完成请求，重叠或过载时关闭连接。
+
+异步额度限制本地任务和完成消息，不限制第三方 RPC 传输或远端 mailbox。RPC 超时返回后，远端操作仍可能继续；下游慢服务需要自己的准入与幂等策略，不能把本地 MaxAsync 当作全链路在途操作上限。
 
 模块需要实现IModule接口
 ```go
@@ -101,6 +113,9 @@ potato.SetNetConfig(&net.Config{
 		MsgHandler:           &MyMsgHandler{}, // 需要用户自己实现IMsgHandler，用于处理消息
 		SendQueueLimit:       4096,             // 未出队消息的上限，超过时关闭连接
 		SendQueueIdleTimeout: 30 * time.Second, // 扩大的发送队列空闲多久后缩回初始容量
+		SendQueueBytesLimit:  8 << 20,          // 显式启用包体计费预算，包含 writer；默认关闭
+		ReceiveBytesLimit:    64 << 20,         // Manager 在途接收包体预算，默认 64 MiB
+		MaxPacketSize:        1 << 20,          // 包体上限，默认 1 MiB
 	})
 // 网络监听器 支持tcp/kcp/ws
 ln, _ := net.NewListener("tcp", ":10086")
@@ -110,15 +125,23 @@ potato.GetNetManager().AddListener(ln)
 
 ⚠️⚠️⚠️ 网络消息按照 `[消息体长度(4字节)] + [消息体]` 为一个数据包来发送 这个4字节的长度默认`大端序` ⚠️⚠️⚠️
 
-消息体上限为 1 MiB，长度头不计入包体上限。TCP、KCP 和 WebSocket 使用同一包格式；WebSocket 单条消息上限包含额外的 4 字节长度头。超长包和不完整的 Protobuf 消息 ID 会返回错误并关闭对应会话。
+Manager 的消息体上限默认 1 MiB，可用 `MaxPacketSize` 设置，长度头不计入包体上限。TCP、KCP 和 WebSocket 使用同一包格式；WebSocket 单条消息上限包含额外的 4 字节长度头。超长包和不完整的 Protobuf 消息 ID 会返回错误并关闭对应会话。独立的 `ReadPacket`、`WritePacket` 保持原签名和 1 MiB 默认上限。
+
+接收端在按长度头分配之前预留 `ReceiveBytesLimit` 额度；短读、解码失败和回调完成后归还。已入队事件的额度由消费者持有，关闭连接不会提前归还。预算耗尽立即关闭该会话，不等待空位。该预算按包体计费，不包含解码膨胀、转发到业务模块后的对象、内核及协议缓冲；多个 Manager 的预算需合计规划。
 
 `Send()` 与 `SendRaw()` 共用按需扩容的环形 FIFO 发送队列，初始容量为 64 条（上限小于 64 时使用该上限），同一调用方依次发送的消息保持入队顺序。发送调用只在内存队列操作期间持有互斥锁，不等待队列空位、编码或网络写入。`SendQueueLimit` 默认 4096，限制尚未出队的消息数量，不包含 writer 已取出的那一条；队列已经达到上限时，下一次发送会立即关闭该会话并丢弃积压消息。环形队列复用出队槽位，底层容量也不超过配置上限。
 
 出队时立即清除消息引用；扩大的队列清空后保留容量，连续空闲达到 `SendQueueIdleTimeout`（默认 30 秒）才缩回初始容量，新一轮发送会重新开始空闲计时。writer 只在需要缩容时启用并复用一个计时器，不为每条消息创建计时器或额外的缩容协程。`Close()` 中断连接读写、释放整个队列并唤醒等待消息的 writer。两个队列配置为零或负数时使用默认值，读写超时仍由 `Timeout` 控制。队列上限按条数计算，消息大小和空闲窗口内保留的槽位容量仍需计入内存预算。
 
-`SendRaw()` 会复制切片，返回后可复用原数据；`Send()` 的消息对象在编码完成前仍需由调用方保证不被修改。发送方法保持原有的无返回值签名，关闭后的发送会被忽略，返回不表示对端已收到消息。
+`SendRaw()` 在检查包长、条数和字节额度后于队列锁内复制切片，返回后可复用原数据；`Send()` 的消息对象在编码完成前仍需由调用方保证不被修改。发送方法保持原有的无返回值签名，关闭后的发送会被忽略，返回不表示对端已收到消息。
+
+`SendQueueBytesLimit` 默认关闭；启用后同时限制排队和 writer 正在处理的消息体计费，超过预算关闭会话。PB codec 实现可选 `ICodecSizer`，在发送调用方计算大小；其他 codec 默认按 `MaxPacketSize` 保守预留。比如 8 MiB 预算配合 1 MiB 最大包长，未知 codec 只能容纳约 8 条待发消息，小 JSON 突发也可能达到限制。自定义 `Size` 必须返回可信包体大小，低估在编码后会被核对；任意对象的堆大小仍不由此预算严格限制。未启用预算时不增加 Size 遍历，编码仍由 writer 完成。
 
 会话接入时确定消息处理器及 `IsMsgInRoutine()` 模式；后续 `SetMsgHandler()` 影响新会话。`Manager.OnDestroy()` 会等待现有会话及回调完成，应从管理生命周期的协程调用。业务回调可以直接调用 `Session.Close()`。
+
+WebSocket 的 HTTP 头、请求、响应及升级握手超时各为 5 秒，HTTP 空闲超时 30 秒，头部上限 32 KiB。每个 WS listener 从 TCP Accept 到最终 Close 独立统计原始连接，并直接使用 `ConnectLimit` 作为上限，尚未完成握手的连接也受限制。Manager 仍用同一个配置值限制所有协议的正式 Session 总数；两层计数不合并，多个 WS listener 的握手中连接也不共享一个计数器。`ConnectLimit` 为零或负数时，两层均使用默认值 50000。停止时一并关闭 HTTP 和已经 Hijack 的连接，归还原始连接额度。
+
+KCP 暂时保留基于上游 v4.3.4 的内部生命周期补丁，确保未被 Accept 的会话也在停止时清理；仅关闭 UDP socket 或框架已经接入的连接不足以完整回收。包格式和 `net.Conn` 接口不变，但 `Session.Conn()/Raw()` 返回的 KCP 具体类型属于内部包，不能再断言为外部 `kcp-go.UDPSession`；需要额外设置时应断言所需方法接口。已验证原版 v4.3.4 Go 客户端在本机 UDP、无加密和 FEC 的配置下互通。保留原因、补丁范围、兼容性和性能边界，以及切回上游前必须通过的验证，见 [KCP 生命周期补丁说明](internal/kcp/README.md)。
 
 消息处理器实现IMsgHandler
 ```go

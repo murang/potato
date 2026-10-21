@@ -20,7 +20,15 @@ func registerConfig(cfg IConfig, consul bool) *Group {
 	if cfg == nil || (reflect.TypeOf(cfg).Kind() == reflect.Ptr && reflect.ValueOf(cfg).IsNil()) {
 		panic("config is nil")
 	}
-	group := &Group{Name: cfg.Name(), Path: cfg.Path(), ConfigType: reflect.TypeOf(cfg), ConfigMap: &sync.Map{}}
+	group := &Group{Name: cfg.Name(), Path: cfg.Path(), ConfigType: reflect.TypeOf(cfg), ConfigMap: &sync.Map{}, consul: consul}
+	if consul {
+		// Consul 的 keyprefix watch 不接受空前缀。沿用注册错误的 panic 契约，
+		// 在修改注册表前失败，避免启动成功但配置永远未加载的隐式状态。
+		if consulPrefix(group.Path) == "" {
+			panic(fmt.Sprintf("Consul config %q has root path %q; use a non-empty directory prefix", group.Name, group.Path))
+		}
+		group.consulKeys = make(map[string]string)
+	}
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	if consul && consulClient != nil {
@@ -33,7 +41,7 @@ func registerConfig(cfg IConfig, consul bool) *Group {
 	return group
 }
 
-// FocusConsulConfig 必须在 SetConsul 之前注册需要监听的配置。
+// FocusConsulConfig 必须在 SetConsul 之前注册，Path 需要使用非根目录前缀。
 func FocusConsulConfig(cfg IConfig) { registerConfig(cfg, true) }
 
 // SetConsul 保留异步加载语义，返回前完成所有 watch 的登记，便于可靠停止。

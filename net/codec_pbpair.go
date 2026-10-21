@@ -12,6 +12,8 @@ import (
 type PbPairCodec struct {
 }
 
+func (c *PbPairCodec) Size(v interface{}) (int, error) { return protobufMessageSize(v) }
+
 func (c *PbPairCodec) Encode(v interface{}) (msgBytes []byte, err error) {
 	msgType := reflect.TypeOf(v)
 

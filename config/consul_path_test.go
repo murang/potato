@@ -31,6 +31,18 @@ func TestWatchPathMatchesConsulKeys(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			setupConfigs(t)
+			if tt.prefix == "" {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("root prefix must fail during registration")
+					}
+					if getGroup("prefix") != nil {
+						t.Fatal("invalid config was registered")
+					}
+				}()
+				FocusConsulConfig(&consulPathConfig{path: tt.path})
+				return
+			}
 			FocusConsulConfig(&consulPathConfig{path: tt.path})
 			watcher := newConfigWatcher(consulPrefix(tt.path), groups)
 			// Consul 返回的 KV Key 不带路径开头的斜杠，需与注册路径使用相同格式。

@@ -1,6 +1,8 @@
 package potato
 
 import (
+	"context"
+
 	"github.com/asynkron/protoactor-go/actor"
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/murang/potato/app"
@@ -30,22 +32,43 @@ func GetRpcManager() *rpc.Manager {
 }
 
 func BroadcastEvent(event any, includeSelf bool) {
-	if _app.GetCluster() == nil {
-		return
-	}
-	_app.GetCluster().MemberList.BroadcastEvent(event, includeSelf)
+	_app.BroadcastEvent(event, includeSelf)
 }
 
 func SetNetConfig(config *net.Config) {
-	_app.NetManager = net.NewManagerWithConfig(config)
+	_app.SetNetConfig(config)
 }
 
 func SetRpcConfig(config *rpc.Config) {
-	_app.RpcManager = rpc.NewManagerWithConfig(config)
+	_app.SetRpcConfig(config)
 }
 
 func RegisterModule(mod app.IModule) {
 	_app.RegisterModule(mod.Name(), mod)
+}
+
+func RegisterModuleWithOptions(mod app.IModule, options app.ModuleOptions) {
+	_app.RegisterModuleWithOptions(mod.Name(), mod, options)
+}
+
+func TrySendToModule[T app.IModule](msg any) error {
+	var mod T
+	return _app.TrySendToModule(mod.Name(), msg)
+}
+
+func RequestToModuleContext[T app.IModule](ctx context.Context, msg any) (any, error) {
+	var mod T
+	return _app.RequestToModuleContext(ctx, mod.Name(), msg)
+}
+
+func TryAsyncToModule[T app.IModule](work func() any) error {
+	var mod T
+	return _app.TryAsyncToModule(mod.Name(), work)
+}
+
+func ModuleStats[T app.IModule]() (app.ModuleStats, error) {
+	var mod T
+	return _app.ModuleStats(mod.Name())
 }
 
 func SendToModule[T app.IModule](msg interface{}) {
@@ -63,6 +86,11 @@ func RequestToModule[T app.IModule](msg interface{}) (interface{}, error) {
 func Start(f func() bool) {
 	_app.Start(f)
 }
+
+func StartWithError(f func() bool) error                    { return _app.StartWithError(f) }
+func StartContext(ctx context.Context, f func() bool) error { return _app.StartContext(ctx, f) }
+func Exit()                                                 { _app.Exit() }
+func Err() error                                            { return _app.Err() }
 
 func Run() {
 	_app.Run()

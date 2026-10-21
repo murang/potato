@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -15,21 +16,17 @@ import (
 var consulClient *api.Client
 var onConfigChange []func(IConfig)
 var watchPlans []*watch.Plan
+var watchGeneration uint64
 
 // 串行执行 OnLoad 和变更回调，锁不用于注册或配置读取，回调中可读取配置和停止监听。
 var configUpdateMu sync.Mutex
 
-type watchedValue struct {
-	index uint64
-	name  string
-	group *Group
-}
-
 type configWatcher struct {
-	prefix string
-	groups map[string]*Group
-	cache  map[string]watchedValue
-	plan   *watch.Plan
+	prefix     string
+	groups     map[string]*Group
+	cache      map[string]uint64
+	plan       *watch.Plan
+	generation uint64
 }
 
 func consulPrefix(path string) string {
@@ -42,9 +39,9 @@ func consulPrefix(path string) string {
 }
 
 func newConfigWatcher(prefix string, registered map[string]*Group) *configWatcher {
-	w := &configWatcher{prefix: prefix, groups: make(map[string]*Group), cache: make(map[string]watchedValue)}
+	w := &configWatcher{prefix: prefix, groups: make(map[string]*Group), cache: make(map[string]uint64), generation: watchGeneration}
 	for name, group := range registered {
-		if consulPrefix(group.Path) == prefix {
+		if group.consul && consulPrefix(group.Path) == prefix {
 			w.groups[name] = group
 		}
 	}
@@ -53,29 +50,33 @@ func newConfigWatcher(prefix string, registered map[string]*Group) *configWatche
 
 func startConsulWatches(client *api.Client) {
 	registryMu.Lock()
-	consulClient = client
-	oldPlans := watchPlans
-	watchPlans = nil
+	// 所有计划校验完成后再切换客户端和代次；任何配置错误都保留旧监听。
+	nextGeneration := watchGeneration + 1
+	var plans []*watch.Plan
 	prefixes := make(map[string]struct{})
 	for _, group := range groups {
-		prefixes[consulPrefix(group.Path)] = struct{}{}
+		if group.consul {
+			prefixes[consulPrefix(group.Path)] = struct{}{}
+		}
 	}
 	for prefix := range prefixes {
 		plan, err := watch.Parse(map[string]interface{}{"type": "keyprefix", "prefix": prefix})
 		if err != nil {
-			log.Sugar.Errorf("watch param parse error: %v", err)
-			continue
+			registryMu.Unlock()
+			panic(fmt.Sprintf("Config SetConsul watch prefix %q: %v", prefix, err))
 		}
 		w := newConfigWatcher(prefix, groups)
 		w.plan = plan
+		w.generation = nextGeneration
 		plan.Handler = func(_ uint64, data interface{}) {
 			if pairs, ok := data.(api.KVPairs); ok {
 				w.apply(pairs)
 			}
 		}
-		watchPlans = append(watchPlans, plan)
+		plans = append(plans, plan)
 	}
-	plans := append([]*watch.Plan(nil), watchPlans...)
+	oldPlans := watchPlans
+	consulClient, watchPlans, watchGeneration = client, plans, nextGeneration
 	registryMu.Unlock()
 
 	for _, plan := range oldPlans {
@@ -96,10 +97,18 @@ func StopWatch() {
 	registryMu.Lock()
 	plans := watchPlans
 	watchPlans = nil
+	watchGeneration++
 	registryMu.Unlock()
 	for _, plan := range plans {
 		plan.Stop()
 	}
+}
+
+func (w *configWatcher) isCurrent() bool {
+	registryMu.RLock()
+	current := w.generation == watchGeneration
+	registryMu.RUnlock()
+	return current && (w.plan == nil || !w.plan.IsStopped())
 }
 
 func (w *configWatcher) resolve(key string) (string, *Group) {
@@ -126,7 +135,7 @@ func (w *configWatcher) resolve(key string) (string, *Group) {
 func (w *configWatcher) apply(pairs api.KVPairs) {
 	configUpdateMu.Lock()
 	defer configUpdateMu.Unlock()
-	if w.plan != nil && w.plan.IsStopped() {
+	if !w.isCurrent() {
 		return
 	}
 
@@ -149,7 +158,7 @@ func (w *configWatcher) apply(pairs api.KVPairs) {
 			continue
 		}
 		currentKeys[pair.Key] = struct{}{}
-		if old, ok := w.cache[pair.Key]; ok && old.index == pair.ModifyIndex {
+		if old, ok := w.cache[pair.Key]; ok && old == pair.ModifyIndex {
 			continue
 		}
 		if len(pair.Value) == 0 {
@@ -173,24 +182,49 @@ func (w *configWatcher) apply(pairs api.KVPairs) {
 	callbacks := append([]func(IConfig){}, onConfigChange...)
 	registryMu.RUnlock()
 	for _, c := range changes {
-		if w.plan != nil && w.plan.IsStopped() {
+		if !w.isCurrent() {
 			return
 		}
 		if !LoadConfigFromBytes(c.pair.Value, c.cfg) {
 			continue
 		}
+		// OnLoad 期间可能已停止或更换 watch。代次检查和发布共用注册锁，
+		// 防止“检查后切代、旧配置再写入”的竞态；用户代码不持有此锁，
+		// 因而回调内 StopWatch 不会等待自身。版本缓存不跨代复用：
+		// 不同 Consul 后端可能以相同 ModifyIndex 返回不同内容。
+		registryMu.RLock()
+		if w.generation != watchGeneration {
+			registryMu.RUnlock()
+			return
+		}
 		c.group.ConfigMap.Store(c.name, c.cfg)
-		// 只有成功发布才记下版本，失败配置不会阻止之后重试。
-		w.cache[c.pair.Key] = watchedValue{index: c.pair.ModifyIndex, name: c.name, group: c.group}
+		c.group.consulKeys[c.pair.Key] = c.name
+		w.cache[c.pair.Key] = c.pair.ModifyIndex
+		registryMu.RUnlock()
 		log.Sugar.Infof("config updated: %s", c.name)
 		for _, f := range callbacks {
+			if !w.isCurrent() {
+				return
+			}
 			f(c.cfg)
 		}
 	}
-	for key, old := range w.cache {
-		if _, exists := currentKeys[key]; !exists {
-			old.group.ConfigMap.Delete(old.name)
+	// 只删除完整快照中缺失的已发布键。存在但 JSON 无效或为空的键仍在
+	// currentKeys 中，保留上次有效值；跨代共享的来源清单覆盖停听期间的删除。
+	for _, group := range w.groups {
+		for key, name := range group.consulKeys {
+			if _, exists := currentKeys[key]; exists {
+				continue
+			}
+			registryMu.RLock()
+			if w.generation != watchGeneration {
+				registryMu.RUnlock()
+				return
+			}
+			group.ConfigMap.Delete(name)
+			delete(group.consulKeys, key)
 			delete(w.cache, key)
+			registryMu.RUnlock()
 			log.Sugar.Infof("config deleted: %s", key)
 		}
 	}

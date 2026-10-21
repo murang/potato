@@ -1,7 +1,6 @@
 package net
 
 import (
-	"context"
 	"io"
 	"net"
 	"net/http"
@@ -24,6 +23,10 @@ type wsListener struct {
 	exit            atomic.Bool
 	startOnce       sync.Once
 	onNewConnection func(net.Conn)
+	connMu          sync.Mutex
+	connections     map[*wsTrackedConn]struct{}
+	connectLimit    int32
+	maxPacketSize   int
 }
 
 func newWsListener(addr string) (*wsListener, error) {
@@ -34,16 +37,25 @@ func newWsListener(addr string) (*wsListener, error) {
 	}
 	log.Sugar.Infof("ws listen on %s", addr)
 	s := &wsListener{
-		addr:     addr,
-		listener: l,
+		addr:          addr,
+		listener:      l,
+		connections:   make(map[*wsTrackedConn]struct{}),
+		connectLimit:  50000,
+		maxPacketSize: maxPackSize,
 		upgrade: &websocket.Upgrader{
+			HandshakeTimeout: 5 * time.Second,
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
 		},
 	}
 	s.server = &http.Server{
-		Handler: s,
+		Handler:           s,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    32 * 1024,
 	}
 	return s, nil
 }
@@ -54,7 +66,7 @@ func (s *wsListener) Start() {
 			return
 		}
 		go func() {
-			if err := s.server.Serve(s.listener); err != nil && err != http.ErrServerClosed && !s.exit.Load() {
+			if err := s.server.Serve(&wsAcceptListener{Listener: s.listener, owner: s}); err != nil && err != http.ErrServerClosed && !s.exit.Load() {
 				log.Sugar.Errorf("ws serve error:%v", err)
 			}
 		}()
@@ -67,17 +79,33 @@ func (s *wsListener) Stop() {
 	}
 	// listener 在构造时已经绑定；尚未 Serve 时 http.Server 不会替我们关闭它。
 	_ = s.listener.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err := s.server.Shutdown(ctx)
-	if err != nil {
+	if err := s.server.Close(); err != nil {
 		log.Sugar.Errorf("close ws listener error: %v", err)
-		return
+	}
+	// HTTP server 不再跟踪 Hijack 的连接，升级响应也可能尚未写完。
+	// 原始连接从 Accept 到最终 Close 都在此登记，不靠 ConnState 交接额度。
+	s.connMu.Lock()
+	connections := make([]*wsTrackedConn, 0, len(s.connections))
+	for conn := range s.connections {
+		connections = append(connections, conn)
+	}
+	s.connMu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
 	}
 }
 
 func (s *wsListener) OnNewConnection(f func(net.Conn)) {
+	s.connMu.Lock()
 	s.onNewConnection = f
+	s.connMu.Unlock()
+}
+
+func (s *wsListener) configure(maxPacketSize int, connectLimit int32) {
+	s.connMu.Lock()
+	s.maxPacketSize = maxPacketSize
+	s.connectLimit = connectLimit
+	s.connMu.Unlock()
 }
 
 func (s *wsListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +123,10 @@ func (s *wsListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if s.onNewConnection == nil {
+	s.connMu.Lock()
+	onNewConnection, maxPacketSize := s.onNewConnection, s.maxPacketSize
+	s.connMu.Unlock()
+	if onNewConnection == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
@@ -105,9 +136,72 @@ func (s *wsListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn.SetReadLimit(maxWsBufferSize)
+	if s.exit.Load() {
+		_ = conn.Close()
+		return
+	}
+	if maxPacketSize <= 0 {
+		maxPacketSize = maxPackSize
+	}
+	conn.SetReadLimit(int64(maxPacketSize) + lenSize)
 	wc := &wsConn{Conn: conn}
-	go s.onNewConnection(wc)
+	go onNewConnection(wc)
+}
+
+// 同一 TCP 连接在 HTTP、升级中和正式 WS 阶段都占一个额度；
+// 只限制每个 listener 的原始连接，不替代 Manager 的正式 Session 上限。
+type wsAcceptListener struct {
+	net.Listener
+	owner *wsListener
+}
+
+func (l *wsAcceptListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		s := l.owner
+		s.connMu.Lock()
+		if s.exit.Load() {
+			s.connMu.Unlock()
+			_ = conn.Close()
+			return nil, net.ErrClosed
+		}
+		limit := s.connectLimit
+		if limit <= 0 {
+			limit = 50000
+		}
+		if len(s.connections) >= int(limit) {
+			s.connMu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		if s.connections == nil {
+			s.connections = make(map[*wsTrackedConn]struct{})
+		}
+		tracked := &wsTrackedConn{Conn: conn, owner: s}
+		s.connections[tracked] = struct{}{}
+		s.connMu.Unlock()
+		return tracked, nil
+	}
+}
+
+type wsTrackedConn struct {
+	net.Conn
+	owner     *wsListener
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (c *wsTrackedConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.Conn.Close()
+		c.owner.connMu.Lock()
+		delete(c.owner.connections, c)
+		c.owner.connMu.Unlock()
+	})
+	return c.closeErr
 }
 
 type wsConn struct {

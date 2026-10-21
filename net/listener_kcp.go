@@ -1,8 +1,8 @@
 package net
 
 import (
+	"github.com/murang/potato/internal/kcp"
 	"github.com/murang/potato/log"
-	"github.com/xtaci/kcp-go"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -12,14 +12,14 @@ import (
 // server
 type kcpListener struct {
 	addr            string
-	listener        net.Listener
+	listener        *kcp.Listener
 	exit            atomic.Bool
 	startOnce       sync.Once
 	onNewConnection func(net.Conn)
 }
 
 func newKcpListener(addr string) (*kcpListener, error) {
-	l, err := kcp.Listen(addr)
+	l, err := kcp.ListenWithOptions(addr, nil, 0, 0)
 	if err != nil {
 		log.Sugar.Errorf("listen error on %s, because: %v", addr, err)
 		return nil, err
@@ -44,7 +44,9 @@ func (s *kcpListener) Stop() {
 	if s.exit.Swap(true) {
 		return
 	}
-	err := s.listener.Close()
+	// 包括尚未 Accept 的 KCP 会话；它们还没有进入 Manager，必须由监听器
+	// 清理。完整关闭等待最后一个 UDP 包处理结束，再移除全局 updater 引用。
+	err := s.listener.Shutdown()
 	if err != nil {
 		log.Sugar.Errorf("close kcp listener error: %v", err)
 		return

@@ -1,6 +1,7 @@
 package net
 
 import (
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -11,12 +12,15 @@ import (
 
 type Config struct {
 	SessionStartId       uint64        // 会话起始 ID
-	ConnectLimit         int32         // 最大并发连接数
+	ConnectLimit         int32         // Manager 会话总数上限，同时作为每个 WS listener 的原始 TCP 连接上限
 	Timeout              int32         // 超时，单位秒
 	Codec                ICodec        // 未设置时使用 JSON
 	MsgHandler           IMsgHandler   // 消息处理器
 	SendQueueLimit       int           // 排队消息上限，不含正在写入的消息；<=0 使用 4096
 	SendQueueIdleTimeout time.Duration // 扩容队列的空闲缩容时间；<=0 使用 30 秒
+	SendQueueBytesLimit  int64         // 排队及 writer 的消息体计费预算；<=0 不启用，不代表对象堆上限
+	ReceiveBytesLimit    int64         // 等待包体、解码及网络回调的包体预算；<=0 使用 64 MiB
+	MaxPacketSize        int           // 包体上限；<=0 或超过长度头/平台 int 可表示范围使用 1 MiB
 }
 
 func defaultConfig() *Config {
@@ -40,7 +44,10 @@ type Manager struct {
 	timeout              int32
 	sendQueueLimit       int
 	sendQueueIdleTimeout time.Duration
-	sessionEventChan     chan *SessionEvent
+	sendQueueBytesLimit  int64
+	maxPacketSize        int
+	receiveBudget        receiveBudget
+	sessionEventChan     chan *queuedSessionEvent
 	msgHandler           IMsgHandler
 	started              bool
 	stopping             bool
@@ -65,7 +72,10 @@ func NewManagerWithConfig(config *Config) *Manager {
 		msgHandler:           config.MsgHandler,
 		sendQueueLimit:       config.SendQueueLimit,
 		sendQueueIdleTimeout: config.SendQueueIdleTimeout,
-		sessionEventChan:     make(chan *SessionEvent, 1024),
+		sendQueueBytesLimit:  config.SendQueueBytesLimit,
+		maxPacketSize:        config.MaxPacketSize,
+		receiveBudget:        receiveBudget{limit: config.ReceiveBytesLimit},
+		sessionEventChan:     make(chan *queuedSessionEvent, 1024),
 		eventsDone:           make(chan struct{}),
 	}
 	if m.codec == nil {
@@ -83,12 +93,21 @@ func NewManagerWithConfig(config *Config) *Manager {
 	if m.sendQueueIdleTimeout <= 0 {
 		m.sendQueueIdleTimeout = defaultSendQueueIdleTimeout
 	}
+	if m.maxPacketSize <= 0 || uint64(m.maxPacketSize) > math.MaxUint32 || m.maxPacketSize > math.MaxInt-lenSize {
+		m.maxPacketSize = maxPackSize
+	}
+	if m.receiveBudget.limit <= 0 {
+		m.receiveBudget.limit = 64 * 1024 * 1024
+	}
 	return m
 }
 
 func (sm *Manager) OnNewConnection(conn net.Conn) { sm.NewSession(conn).Start() }
 
 func (sm *Manager) AddListener(ln IListener) {
+	if ws, ok := ln.(*wsListener); ok {
+		ws.configure(sm.maxPacketSize, sm.connectLimit)
+	}
 	ln.OnNewConnection(sm.OnNewConnection)
 	sm.connMu.Lock()
 	if sm.stopping {
@@ -162,7 +181,10 @@ func (sm *Manager) startEvents() {
 	})
 }
 
-func (sm *Manager) dispatch(event *SessionEvent) {
+func (sm *Manager) dispatch(event *queuedSessionEvent) {
+	// 一旦成功投递，只有消费者拥有额度；Session.Close 不可提前归还
+	// 尚在排队或执行的事件，否则关闭连接就能绕过在途消息预算。
+	defer sm.receiveBudget.release(event.receiveBytes)
 	h := event.Session.handler
 	switch event.Type {
 	case SessionOpen:

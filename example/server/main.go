@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"time"
 
 	"github.com/asynkron/protoactor-go/cluster"
@@ -17,11 +18,12 @@ func main() {
 
 	// 网络设置
 	potato.SetNetConfig(&net.Config{
-		SessionStartId: 0,
-		ConnectLimit:   1000,
-		Timeout:        30,
-		Codec:          &net.PbCodec{},
-		MsgHandler:     &MyMsgHandler{},
+		SessionStartId:      0,
+		ConnectLimit:        1000,
+		Timeout:             30,
+		Codec:               &net.PbCodec{},
+		MsgHandler:          &MyMsgHandler{},
+		SendQueueBytesLimit: 8 << 20, // 示例启用消息体预算；生产值需按消息大小压测
 	})
 	// 网络监听器 支持tcp/kcp/ws
 	ln, err := net.NewListener("tcp", ":10086")
@@ -42,12 +44,16 @@ func main() {
 		},
 	})
 
-	potato.Start(func() bool { // 初始化app 入参为启动函数 在初始化所有组件后执行
-		log.Logger.Info("all module started, server start")
+	potato.Start(func() bool { // 先初始化资源；模块 ready 后才开放 RPC 和网络
+		log.Logger.Info("resources initialized, starting modules")
 		return true
 	})
 	potato.Run()        // 开始update 所有组件开始tick 主线程阻塞
 	potato.End(func() { // 主线程开始退出 所有组件销毁后执行入参函数
 		log.Logger.Info("all module stopped, server stop")
 	})
+	if err := potato.Err(); err != nil {
+		log.Sugar.Errorf("server failed: %v", err)
+		os.Exit(1)
+	}
 }

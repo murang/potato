@@ -3,12 +3,27 @@ package main
 import (
 	"example/nicepb/nice"
 	"fmt"
+	"time"
 
+	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/murang/potato"
 	"github.com/murang/potato/log"
+	"github.com/murang/potato/net"
 )
 
 type NiceModule struct {
+	pending map[uint64]bool // accessed only by the module actor
+}
+
+type helloRequest struct {
+	session *net.Session
+	name    string
+}
+
+type helloResult struct {
+	session *net.Session
+	text    string
+	err     error
 }
 
 func (n *NiceModule) Name() string {
@@ -20,6 +35,7 @@ func (n *NiceModule) FPS() uint {
 }
 
 func (n *NiceModule) OnStart() {
+	n.pending = make(map[uint64]bool)
 	log.Sugar.Info("start")
 }
 
@@ -32,17 +48,49 @@ func (n *NiceModule) OnDestroy() {
 }
 
 func (n *NiceModule) OnMsg(msg interface{}) {
-	log.Sugar.Infof("msg: %v", msg)
+	switch msg := msg.(type) {
+	case helloRequest:
+		if msg.session.IsClosed() {
+			return
+		}
+		if n.pending[msg.session.ID()] {
+			// This protocol has no request ID. Closing on overlapping requests is
+			// explicit; an uncorrelated Busy reply could be mistaken for success.
+			msg.session.Close()
+			return
+		}
+		c := potato.GetCluster()
+		n.pending[msg.session.ID()] = true
+		err := potato.TryAsyncToModule[*NiceModule](func() any {
+			// Only immutable snapshots are captured; never read or write n here.
+			grain := nice.GetCalculatorGrainClient(c, "NiceIdentity")
+			sum, err := grain.Sum(&nice.Input{A: 6, B: 6}, cluster.WithTimeout(3*time.Second))
+			result := helloResult{session: msg.session, err: err}
+			if err == nil {
+				if sum == nil {
+					result.err = fmt.Errorf("calculator returned no result")
+				} else {
+					result.text = fmt.Sprintf("Nice ~  %s cal sum : %d", msg.name, sum.Result)
+				}
+			}
+			return result
+		})
+		if err != nil {
+			delete(n.pending, msg.session.ID())
+			msg.session.Close()
+		}
+	case helloResult:
+		delete(n.pending, msg.session.ID())
+		if msg.err != nil {
+			log.Sugar.Warnf("sum failed: %v", msg.err)
+			msg.session.Close()
+			return
+		}
+		msg.session.Send(&nice.S2C_Hello{SayHi: msg.text})
+	}
 }
 
 func (n *NiceModule) OnRequest(msg interface{}) interface{} {
-	log.Sugar.Infof("request: %v", msg)
-	// 自定义id用于在service方生成虚拟actor 在service节点没有变动的情况下 同一个identity会始终路由到同一个service
-	grain := nice.GetCalculatorGrainClient(potato.GetCluster(), "NiceIdentity")
-	sum, err := grain.Sum(&nice.Input{A: 6, B: 6})
-	if err != nil {
-		log.Sugar.Errorf("sum error: %v", err)
-		return "sum error: " + err.Error()
-	}
-	return fmt.Sprintf("Nice ~  %s cal sum : %d", msg, sum.Result)
+	// Synchronous module requests are reserved for short, local computations.
+	return fmt.Sprintf("Nice ~ %s", msg)
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"example/nicepb/nice"
 	"log"
 	"net"
@@ -48,16 +47,8 @@ func main() {
 				return
 			}
 
-			pkt := make([]byte, 4+len(bytes))
-
-			// Length
-			binary.BigEndian.PutUint32(pkt, uint32(len(bytes)))
-
-			// Value
-			copy(pkt[4:], bytes)
-
-			// 发送消息
-			if _, err := conn.Write(pkt); err != nil {
+			// 与服务端共用包格式，并正确处理一次 Write 未写完全部数据的情况。
+			if err := pnet.WritePacket(conn, bytes); err != nil {
 				log.Printf("发送消息失败: %v", err)
 				return
 			}
@@ -72,16 +63,17 @@ func main() {
 
 // 读取服务器返回的消息
 func readServerMessages(conn net.Conn) {
-	buf := make([]byte, 1024)
+	codec := &pnet.PbCodec{}
 	for {
-		n, err := conn.Read(buf)
+		// TCP 不保留消息边界：一次 Read 可能只有部分长度头，也可能含多个包。
+		// ReadPacket 读满当前包并限制包长，下一轮继续处理其余包。
+		data, err := pnet.ReadPacket(conn)
 		if err != nil {
 			log.Printf("读取服务器消息失败: %v", err)
 			return
 		}
 
-		codec := &pnet.PbCodec{}
-		msg, err := codec.Decode(buf[4:n])
+		msg, err := codec.Decode(data)
 		if err != nil {
 			log.Printf("反序列化消息失败: %v", err)
 			return

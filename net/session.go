@@ -23,6 +23,7 @@ type outgoingMessage struct {
 	message any
 	raw     []byte
 	isRaw   bool
+	charge  int64
 }
 
 const (
@@ -41,6 +42,7 @@ type Session struct {
 	outgoing          []outgoingMessage
 	outgoingHead      int
 	outgoingLen       int
+	outgoingBytes     int64 // 包含已出队但尚未写完的消息；由 outgoingMu 保护
 	outgoingWake      chan struct{}
 	outgoingIdleAt    time.Time
 	outgoingIdleTimer *time.Timer // 仅由 writer 创建、复用和停止
@@ -56,6 +58,12 @@ type SessionEvent struct {
 	Msg     interface{}
 }
 
+// 保留公开 SessionEvent 的形状；内部事件携带原始包体额度，不另建消息队列。
+type queuedSessionEvent struct {
+	SessionEvent
+	receiveBytes int64
+}
+
 func (s *Session) Conn() net.Conn   { return s.conn }
 func (s *Session) ID() uint64       { return s.id }
 func (s *Session) Raw() interface{} { return s.Conn() }
@@ -68,6 +76,13 @@ func (s *Session) Close() {
 			_ = s.conn.Close()
 		}
 		s.outgoingMu.Lock()
+		if s.outgoingBytes != 0 {
+			// 默认未启用计费时保持 O(1) 清理；启用时也只扫描仍在排队的槽位。
+			for i := 0; i < s.outgoingLen; i++ {
+				index := (s.outgoingHead + i) % len(s.outgoing)
+				s.outgoingBytes -= s.outgoing[index].charge
+			}
+		}
 		s.outgoing = nil
 		s.outgoingHead = 0
 		s.outgoingLen = 0
@@ -79,16 +94,40 @@ func (s *Session) Close() {
 // Send 将消息加入按需扩容的发送队列，不等待队列空位或网络写入。
 // 达到排队消息上限后的新发送会关闭会话；返回不表示消息已送达。
 func (s *Session) Send(msg interface{}) {
-	if msg != nil {
-		s.enqueue(outgoingMessage{message: msg})
+	if msg == nil || s.IsClosed() {
+		return
 	}
+	next := outgoingMessage{message: msg}
+	if s.manager.sendQueueBytesLimit > 0 {
+		// Size 在队列锁外运行；禁用预算时不增加旧 Send 的同步遍历成本。
+		// 未知 codec 按最大合法包体计费，只约束编码量，不能估算任意对象的堆大小。
+		size := s.manager.maxPacketSize
+		if codec, ok := s.manager.codec.(ICodecSizer); ok {
+			var err error
+			size, err = codec.Size(msg)
+			if err != nil || size < 0 || size > s.manager.maxPacketSize {
+				s.Close()
+				return
+			}
+		}
+		next.charge = int64(size)
+	}
+	s.enqueue(next)
 }
 
 // SendRaw 在返回前复制数据，调用方可以随后复用原切片。
 // Send 和 SendRaw 共用可扩容的 FIFO，都不等待队列空位或网络写入。
 func (s *Session) SendRaw(data []byte) {
 	if data != nil && !s.IsClosed() {
-		s.enqueue(outgoingMessage{raw: bytes.Clone(data), isRaw: true})
+		if len(data) > s.manager.maxPacketSize {
+			s.Close()
+			return
+		}
+		next := outgoingMessage{raw: data, isRaw: true}
+		if s.manager.sendQueueBytesLimit > 0 {
+			next.charge = int64(len(data))
+		}
+		s.enqueue(next)
 	}
 }
 
@@ -102,11 +141,17 @@ func (s *Session) enqueue(msg outgoingMessage) {
 		s.outgoingMu.Unlock()
 		return
 	}
-	if s.outgoingLen >= s.manager.sendQueueLimit {
+	if s.outgoingLen >= s.manager.sendQueueLimit ||
+		(s.manager.sendQueueBytesLimit > 0 && msg.charge > s.manager.sendQueueBytesLimit-s.outgoingBytes) {
 		// Close 也会取得队列锁，必须先解锁，避免超限处理死锁。
 		s.outgoingMu.Unlock()
 		s.Close()
 		return
+	}
+	if msg.isRaw {
+		// 先准入再复制，避免被拒绝的大包仍瞬时占用额外内存。
+		// ponytail: 复制和入队共用短锁以保持 FIFO；仅在实测锁争用后再拆预留阶段。
+		msg.raw = bytes.Clone(msg.raw)
 	}
 	// 环形队列复用出队槽位，上限附近也不需要逐条搬动积压消息。
 	// 只有槽位用完时才扩容；拆开环的两段复制，保持已有消息的顺序。
@@ -124,6 +169,7 @@ func (s *Session) enqueue(msg outgoingMessage) {
 	}
 	s.outgoing[tail] = msg
 	s.outgoingLen++
+	s.outgoingBytes += msg.charge
 	if s.outgoingLen == 1 {
 		s.outgoingIdleAt = time.Time{}
 		// 只在空队列变为非空时唤醒 writer；通知合并，不等待发送方。
@@ -222,7 +268,7 @@ func (s *Session) Start() {
 }
 
 func (s *Session) lifecycleEvent(kind SessionEventType) {
-	event := &SessionEvent{Session: s, Type: kind}
+	event := &queuedSessionEvent{SessionEvent: SessionEvent{Session: s, Type: kind}}
 	if s.inRoutine {
 		s.manager.dispatch(event)
 	} else {
@@ -235,7 +281,7 @@ func (s *Session) readLoop() {
 	defer s.exitSync.Done()
 	defer s.Close()
 	for !s.IsClosed() {
-		data, err := s.readMessageBytes()
+		data, charge, err := s.readMessageBytes()
 		if err != nil {
 			if !s.IsClosed() && !isClosedError(err) {
 				log.Sugar.Warnf("session read error, sesid: %d, err: %v", s.ID(), err)
@@ -244,18 +290,24 @@ func (s *Session) readLoop() {
 		}
 		msg, err := s.manager.codec.Decode(data)
 		if err != nil {
+			s.manager.receiveBudget.release(charge)
 			log.Sugar.Warnf("decode msg error, sesid: %d, err: %v", s.ID(), err)
 			return
 		}
 		if s.IsClosed() {
+			s.manager.receiveBudget.release(charge)
 			return
 		}
-		event := &SessionEvent{Session: s, Type: SessionMsg, Msg: msg}
+		event := &queuedSessionEvent{
+			SessionEvent: SessionEvent{Session: s, Type: SessionMsg, Msg: msg},
+			receiveBytes: charge,
+		}
 		if s.inRoutine {
 			s.manager.dispatch(event)
 		} else {
 			select {
 			case <-s.done:
+				s.manager.receiveBudget.release(charge)
 				return
 			case s.manager.sessionEventChan <- event:
 			}
@@ -263,13 +315,13 @@ func (s *Session) readLoop() {
 	}
 }
 
-func (s *Session) readMessageBytes() ([]byte, error) {
+func (s *Session) readMessageBytes() ([]byte, int64, error) {
 	if s.manager.timeout != 0 {
 		if err := s.conn.SetReadDeadline(time.Now().Add(time.Duration(s.manager.timeout) * time.Second)); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
-	return ReadPacket(s.conn)
+	return readPacket(s.conn, s.manager.maxPacketSize, &s.manager.receiveBudget)
 }
 
 func (s *Session) writeLoop() {
@@ -283,18 +335,12 @@ func (s *Session) writeLoop() {
 	for {
 		next, ok := s.nextOutgoing()
 		if !ok || s.IsClosed() {
+			if ok {
+				s.releaseOutgoing(next.charge)
+			}
 			return
 		}
-		data := next.raw
-		if !next.isRaw {
-			var err error
-			data, err = s.manager.codec.Encode(next.message)
-			if err != nil {
-				log.Sugar.Errorf("encode msg error, sesid: %d, err: %v", s.ID(), err)
-				return
-			}
-		}
-		if err := s.sendMessageBytes(data); err != nil {
+		if err := s.writeOutgoing(next); err != nil {
 			if !s.IsClosed() && !isClosedError(err) {
 				log.Sugar.Warnf("session write error, sesid: %d, err: %v", s.ID(), err)
 			}
@@ -303,13 +349,53 @@ func (s *Session) writeLoop() {
 	}
 }
 
+func (s *Session) releaseOutgoing(charge int64) {
+	if charge != 0 {
+		s.outgoingMu.Lock()
+		s.outgoingBytes -= charge
+		s.outgoingMu.Unlock()
+	}
+}
+
+func (s *Session) writeOutgoing(next outgoingMessage) error {
+	// 出队不归还额度：慢连接仍持有包体。Close 只归还排队条目，
+	// writer 无论编码失败、部分写失败或连接关闭，都在自己的退出路径归还一次。
+	defer func() { s.releaseOutgoing(next.charge) }()
+	data := next.raw
+	if !next.isRaw {
+		var err error
+		data, err = s.manager.codec.Encode(next.message)
+		if err != nil {
+			return err
+		}
+		next.message = nil
+	}
+	if len(data) > s.manager.maxPacketSize {
+		return ErrMaxPacket
+	}
+	if s.manager.sendQueueBytesLimit > 0 && int64(len(data)) > next.charge {
+		// 自定义 Size 低估、或调用方违反对象不可变契约时，先补足额度再写。
+		// 编码已经产生的临时分配只能事后检测，因此不能宣称 heap 硬上限。
+		extra := int64(len(data)) - next.charge
+		s.outgoingMu.Lock()
+		if s.IsClosed() || extra > s.manager.sendQueueBytesLimit-s.outgoingBytes {
+			s.outgoingMu.Unlock()
+			return errors.New("send message body budget exhausted")
+		}
+		s.outgoingBytes += extra
+		next.charge += extra
+		s.outgoingMu.Unlock()
+	}
+	return s.sendMessageBytes(data)
+}
+
 func (s *Session) sendMessageBytes(msg []byte) error {
 	if s.manager.timeout != 0 {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(time.Duration(s.manager.timeout) * time.Second)); err != nil {
 			return err
 		}
 	}
-	return WritePacket(s.conn, msg)
+	return writePacket(s.conn, msg, s.manager.maxPacketSize)
 }
 
 func isClosedError(err error) bool {

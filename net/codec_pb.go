@@ -3,6 +3,7 @@ package net
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"reflect"
 
 	"github.com/murang/potato/pb"
@@ -22,6 +23,23 @@ var (
 )
 
 type PbCodec struct {
+}
+
+func (c *PbCodec) Size(v interface{}) (int, error) { return protobufMessageSize(v) }
+
+func protobufMessageSize(v interface{}) (int, error) {
+	if pb.GetIdByType(reflect.TypeOf(v)) == 0 {
+		return 0, ErrorMsgNotRegister
+	}
+	msg, ok := v.(proto.Message)
+	if !ok {
+		return 0, ErrorMsgTypeNotMatch
+	}
+	size := vt.Size(msg)
+	if size < 0 || size > math.MaxInt-lenMsgId {
+		return 0, ErrMaxPacket
+	}
+	return lenMsgId + size, nil
 }
 
 func (c *PbCodec) Encode(v interface{}) (msgBytes []byte, err error) {
